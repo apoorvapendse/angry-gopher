@@ -12,7 +12,8 @@ import type { Card } from "../core/card.ts";
 import { cardLabel } from "../core/card.ts";
 import { isPartialOk, isCompleteGroup } from "../core/card_stack.ts";
 import { solveBoard } from "../bfs/engine_v2.ts";
-import type { Move } from "../bfs/move.ts";
+import { describe, type Move } from "../bfs/move.ts";
+import { compressHint } from "./hint_compress.ts";
 
 export interface LogicalMovesForPlay {
   readonly cardsToPlay: readonly Card[];
@@ -28,7 +29,25 @@ interface MeldablePair {
 export function findLogicalMovesForPlay(
   hand: readonly Card[],
   board: readonly (readonly Card[])[],
+  handLonerPlaced: boolean,
 ): LogicalMovesForPlay | null {
+  // A hand-origin loner was just laid onto an empty spot. Try to finish the
+  // board with NO new projection first — the player's unfinished business is
+  // that loner, and opening a new front (projecting more hand cards) is what
+  // produced the bundled, over-complex hints. Cheapest first: wholesale
+  // merges (whole stacks that simply join — what a human sees before
+  // anything merits the word "solve"), then the board-only BFS. The
+  // dirty-board contract makes solveBoard fail unless EVERY stack (the
+  // loner included) ends legal, so a board-only success is a genuine
+  // self-contained completion. On failure we fall through to projection
+  // (today's behavior) — non-regressive.
+  if (handLonerPlaced) {
+    const wholesale = wholesaleMergePlay(board);
+    if (wholesale !== null) return wholesale;
+    const boardOnly = boardOnlyPlay(board);
+    if (boardOnly !== null) return boardOnly;
+  }
+
   const meldable = collectMeldablePairs(hand);
 
   if (boardIsClean(board)) {
@@ -59,8 +78,12 @@ export function findLogicalMovesForPlay(
 
 export function formatHint(result: LogicalMovesForPlay | null): readonly string[] {
   if (result === null) return [];
-  const labels = result.cardsToPlay.map(cardLabel).join(" ");
-  return [`place [${labels}] from hand`, ...result.moveLines];
+  // A board-only finish (loner completed with board cards) plays no new card,
+  // so there is no "place … from hand" line — just the board moves.
+  const lines = result.cardsToPlay.length === 0
+    ? [...result.moveLines]
+    : [`place [${result.cardsToPlay.map(cardLabel).join(" ")}] from hand`, ...result.moveLines];
+  return compressHint(lines);
 }
 
 // --- Pair collection ----------------------------------------------------
@@ -149,4 +172,114 @@ function shortestPlan(candidates: readonly LogicalMovesForPlay[]): LogicalMovesF
 
 function boardIsClean(board: readonly (readonly Card[])[]): boolean {
   return board.every(isCompleteGroup);
+}
+
+/** Wholesale-merge pre-pass: a human looks for whole stacks that simply
+ *  join BEFORE anything complicated enough to merit the word "solve" — and
+ *  prefers moving the broken thing onto the good structure, never shaving
+ *  the good structure to feed the broken thing (which the trouble-greedy
+ *  BFS happily does; it found peel-7♥-onto-the-pair where a human pushes
+ *  the pair onto the run). Each greedy pass tries trouble+trouble joins
+ *  first (fix the broken with the broken — [K♠ A♦] + [2♠] snap into the
+ *  wrap run without touching any helper), then incomplete-onto-helper
+ *  merges, until nothing joins. Only a fully clean board counts: anything
+ *  short returns null and the caller falls through to the solver — never
+ *  a half-applied merge list. The merges are genuine Moves rendered via
+ *  describe(), so the line format has one authority and flows through
+ *  compressHint like any solver plan. */
+function wholesaleMergePlay(
+  board: readonly (readonly Card[])[],
+): LogicalMovesForPlay | null {
+  const stacks: (readonly Card[])[] = [...board];
+  const moves: Move[] = [];
+  while (troubleTroubleMerge(stacks, moves) || troubleHelperMerge(stacks, moves)) {
+    // greedy fixpoint
+  }
+  if (moves.length === 0 || !stacks.every(isCompleteGroup)) return null;
+  return {
+    cardsToPlay: [],
+    moves,
+    moveLines: moves.map(describe),
+  };
+}
+
+/** One trouble+trouble join, if any exists: two incomplete stacks whose
+ *  concatenation is a COMPLETE group. Board stacks are always legal-or-
+ *  partial, so incompletes are length 1–2 and the only completable shape
+ *  is single+pair — exactly the engine's free_pull (rendered `pull X onto
+ *  [pair]`). Never merges two loose cards into a still-troublesome pair:
+ *  they may have been split apart for good board-wide reasons, and only a
+ *  COMPLETE result counts. (Pair+pair→4 has no verb and no real case yet;
+ *  it stays invisible here and falls to the solver.) */
+function troubleTroubleMerge(
+  stacks: (readonly Card[])[],
+  moves: Move[],
+): boolean {
+  for (let i = 0; i < stacks.length; i++) {
+    const s = stacks[i]!;
+    if (s.length !== 1) continue;
+    for (let j = 0; j < stacks.length; j++) {
+      const t = stacks[j]!;
+      if (j === i || t.length !== 2 || isCompleteGroup(t)) continue;
+      for (const side of ["right", "left"] as const) {
+        const result = side === "right" ? [...t, ...s] : [...s, ...t];
+        if (!isCompleteGroup(result)) continue;
+        moves.push({
+          type: "free_pull",
+          loose: s[0]!,
+          targetBefore: t,
+          targetBucketBefore: "trouble",
+          result,
+          side,
+          graduated: true,
+        });
+        stacks[j] = result;
+        stacks.splice(i, 1);
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/** One incomplete-onto-helper join, if any exists: an incomplete stack
+ *  whose wholesale concatenation onto a complete group (either end) is
+ *  itself complete — the engine's push. */
+function troubleHelperMerge(
+  stacks: (readonly Card[])[],
+  moves: Move[],
+): boolean {
+  for (let i = 0; i < stacks.length; i++) {
+    const s = stacks[i]!;
+    if (isCompleteGroup(s)) continue;
+    for (let j = 0; j < stacks.length; j++) {
+      const t = stacks[j]!;
+      if (j === i || !isCompleteGroup(t)) continue;
+      for (const side of ["right", "left"] as const) {
+        const result = side === "right" ? [...t, ...s] : [...s, ...t];
+        if (!isCompleteGroup(result)) continue;
+        moves.push({ type: "push", troubleBefore: s, targetBefore: t, result, side });
+        stacks[j] = result;
+        stacks.splice(i, 1);
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/** Try to make the whole board legal using only board→board moves — no new
+ *  hand card projected. Returns a play with empty `cardsToPlay`, or null if
+ *  the board can't be resolved without a hand card (or is already clean, so
+ *  there is nothing to finish). */
+function boardOnlyPlay(
+  board: readonly (readonly Card[])[],
+): LogicalMovesForPlay | null {
+  const result = solveBoard(board);
+  if (result === null || result.plan.length === 0) return null;
+  return {
+    cardsToPlay: [],
+    moves: result.plan.map(p => p.move),
+    moveLines: result.plan.map(p => p.line),
+  };
 }

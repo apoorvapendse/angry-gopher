@@ -1,12 +1,44 @@
+//! markdown: the block workhorse + public entry points of the chat dialect.
+//! render()/renderTrusted()/hostileReason() live here, along with the recursive
+//! block layer (paragraphs, ATX headings, fenced code, lists, blockquotes, the
+//! raw-HTML block) — one mutually-recursive descent kept whole on purpose.
+//!
+//! The leaf pieces it drives, each its own file (one-way DAG, no cycles):
+//!   markdown_text   — escaping + char-class predicates (pure leaf; everyone uses it)
+//!   markdown_fence  — the fenced-code grammar (line-based predicates)
+//!   markdown_media  — the locked same-origin <img>/<video> rebuilder (safety + dims)
+//!   markdown_inline — the inline pass (emphasis, code spans, links, autolinks),
+//!                     which also emits MSG_ refs + external-link attrs inline
+//!   markdown_links  — the MSG_-reference + external-link RULES (helpers the
+//!                     inline pass calls at emit time; no longer a post-pass)
+//!
+//! markdown.zig (this file) IS the dialect's source of truth; the gold corpus in
+//! markdown_regression_test.zig freezes render()'s output so nothing here can
+//! silently regress.
+
 const std = @import("std");
+const fence = @import("markdown_fence.zig");
+const mtext = @import("markdown_text.zig");
+const mmedia = @import("markdown_media.zig");
+const minline = @import("markdown_inline.zig");
+
+// Shared text primitives live in the markdown_text leaf; alias the few the block
+// layer still uses so the renderer bodies read unqualified.
+const escapeInto = mtext.escapeInto;
+const isDigit = mtext.isDigit;
+const isAsciiAlpha = mtext.isAsciiAlpha;
+const Budget = mtext.Budget;
+const RenderError = mtext.RenderError;
 
 /// render turns a raw chat message body into HTML. It implements — and IS the
 /// definition of — lynrummy's markdown dialect: GFM-style paragraphs with hard
-/// wraps, then escape-but-img, then the MSG_ reference linkifier. (The dialect's
+/// wraps, escape-but-img, and MSG_ reference links emitted inline. (The dialect's
 /// ancestry is goldmark/CommonMark, but there is no external oracle: the gold
-/// corpus in main.zig freezes THIS function's output so it can't regress.)
+/// corpus in markdown_regression_test.zig freezes THIS function's output so it
+/// can't regress.)
 /// Currently: paragraphs (hard wraps + escaping), raw HTML (escape everything
-/// but a same-origin <img>, block and inline), and the MSG_ reference linkifier.
+/// but a same-origin <img>, block and inline), and MSG_ reference links + the
+/// external-link new-tab rule, both produced by the inline pass at emit time.
 ///
 /// Caller owns the returned slice; pass an arena and reset it per message.
 ///
@@ -17,9 +49,53 @@ const std = @import("std");
 /// (chat send, docs post) check hostileReason themselves first to fail the
 /// POST loudly; this guard covers every other render path (backlog, preview).
 pub fn render(a: std.mem.Allocator, md: []const u8) ![]const u8 {
-    if (hostileReason(md) != null) return a.dupe(u8, malformed_html);
-    const body = try renderBlocks(a, md);
-    return try linkifyMsgRefs(a, body);
+    var budget = Budget.forInput(md);
+    return renderBlocks(a, md, false, &budget) catch |e| switch (e) {
+        error.Hostile => a.dupe(u8, malformed_html),
+        else => |x| x,
+    };
+}
+
+/// renderTrusted is render() for SERVER-OWNED content (not user-submitted): the
+/// same block/inline pipeline, but with an UNLIMITED work budget. A curated file
+/// like the per-user Links page is dense but linear, so it never approaches the
+/// budget anyway; unlimited just states the contract (we authored it, it is not
+/// an attack vector). The structural crash guards (block-nesting depth) and HTML
+/// escaping still apply. NEVER call this on input that came from a request body.
+pub fn renderTrusted(a: std.mem.Allocator, md: []const u8) ![]const u8 {
+    var budget = Budget.unlimited();
+    return renderBlocks(a, md, false, &budget) catch |e| switch (e) {
+        error.Hostile => a.dupe(u8, malformed_html),
+        else => |x| x,
+    };
+}
+
+/// renderTrustedReflow is renderTrusted for PROSE (blog articles): paragraphs
+/// reflow to the reader's viewport. A source line wrap joins with a single space
+/// rather than a hard `<br>`, so an inline span (emphasis, code, link) can cross
+/// an author's line wrap, and the text rewraps to the reader's width. The
+/// hard-wrap dialect — every newline a `<br>` — stays the default for chat/docs,
+/// where a line break is content; reflow is only for server-owned long-form
+/// writing. Same trusted (uncapped) pipeline as renderTrusted otherwise.
+pub fn renderTrustedReflow(a: std.mem.Allocator, md: []const u8) ![]const u8 {
+    var budget = Budget.unlimited();
+    return renderBlocks(a, md, true, &budget) catch |e| switch (e) {
+        error.Hostile => a.dupe(u8, malformed_html),
+        else => |x| x,
+    };
+}
+
+/// workUnits renders `md` with an unlimited budget and reports the work it cost
+/// (scan-steps charged) — the deterministic measure the Budget caps on. For
+/// tuning Budget.per_byte from the real corpus (see markdown_hostile_probe), and
+/// for spot-checking that the parser stays linear. Renders into a throwaway
+/// arena, so it costs a full render and returns nothing but the count.
+pub fn workUnits(a: std.mem.Allocator, md: []const u8) !usize {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var budget = Budget.unlimited();
+    _ = try renderBlocks(arena.allocator(), md, false, &budget);
+    return budget.spent;
 }
 
 /// malformed_html is what a rejected (hostile / over-formatted) message renders
@@ -27,55 +103,30 @@ pub fn render(a: std.mem.Allocator, md: []const u8) ![]const u8 {
 /// from the server (the client may style .md-malformed).
 pub const malformed_html = "<p class=\"md-malformed\">⚠️ malformed markdown — not rendered</p>\n";
 
-/// max_markup_tokens caps how many inline markup characters (`* _ [ ] ` ~ <`)
-/// a single message/doc may contain OUTSIDE fenced code. Ordinary prose uses a
-/// handful; a flood (hundreds–thousands) is an attack or a paste accident, and
-/// some of those constructs drive the inline scanners (links, emphasis, email
-/// autolinks). Real conversation never approaches this; past it we reject the
-/// whole input as malformed rather than render it. Fenced code is exempt —
-/// snake_case and indexing are ordinary text there, and code never reaches the
-/// inline scanners anyway. (Steve, 2026-06-19: reject over-formatted input
-/// rather than risk the server; "no more than ~256 non-ordinary-text tokens.")
-const max_markup_tokens = 256;
-
-/// hostileReason scans `md` once and returns a short reason if it's hostile or
-/// absurdly over-formatted (and should render as malformed_html / be refused at
-/// POST), or null if it's safe to render. Cheap and linear: a single line walk
-/// that skips fenced code blocks and counts inline markup characters elsewhere.
-pub fn hostileReason(md: []const u8) ?[]const u8 {
-    var tokens: usize = 0;
-    var fence_char: u8 = 0; // 0 = not inside a fenced code block
-    var fence_count: usize = 0;
-    var pos: usize = 0;
-    while (pos < md.len) {
-        const eol = lineEnd(md, pos);
-        const line = md[pos..eol];
-        const next = if (eol < md.len) eol + 1 else md.len;
-        if (fence_char != 0) {
-            // Inside a fenced code block: code is ordinary text, count nothing.
-            if (isClosingFence(line, fence_char, fence_count)) fence_char = 0;
-        } else if (parseFenceOpen(md, pos)) |fo| {
-            fence_char = fo.char;
-            fence_count = fo.count;
-        } else {
-            for (line) |c| switch (c) {
-                '*', '_', '[', ']', '`', '~', '<' => {
-                    tokens += 1;
-                    if (tokens > max_markup_tokens) return "too much markdown formatting";
-                },
-                else => {},
-            };
-        }
-        pos = next;
-    }
+/// hostileReason returns a short reason if `md` would blow the render work
+/// budget (and so should be refused at POST / rendered as malformed_html), or
+/// null if it's safe. It renders in good faith with the real budget into a
+/// throwaway arena — there is no separate "is it hostile?" model that could
+/// drift from the parser; the parser IS the judge. Costs one render of `md`
+/// (cheap for legit input, and bounded for hostile input — that's the trade:
+/// we start the parse in good faith rather than pre-screening). OOM is not
+/// "hostile" — we report null and let the real render path surface it.
+pub fn hostileReason(a: std.mem.Allocator, md: []const u8) ?[]const u8 {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var budget = Budget.forInput(md);
+    _ = renderBlocks(arena.allocator(), md, false, &budget) catch |e| switch (e) {
+        error.Hostile => return "too much markdown formatting",
+        error.OutOfMemory => return null,
+    };
     return null;
 }
 
 // --- block rendering --------------------------------------------------------
 
-fn renderBlocks(a: std.mem.Allocator, md: []const u8) ![]const u8 {
+fn renderBlocks(a: std.mem.Allocator, md: []const u8, soft_wrap: bool, budget: *Budget) RenderError![]const u8 {
     var out: std.ArrayList(u8) = .empty;
-    try renderBlocksInto(&out, a, md, false, 0);
+    try renderBlocksInto(&out, a, md, false, 0, soft_wrap, budget);
     return out.toOwnedSlice(a);
 }
 
@@ -96,16 +147,20 @@ const max_block_depth = 16;
 /// trailing newline of its own. `depth` is the block-nesting level (see
 /// max_block_depth) — past the cap, the remaining source renders as one escaped
 /// paragraph with no further block recursion.
-fn renderBlocksInto(out: *std.ArrayList(u8), a: std.mem.Allocator, md: []const u8, tight: bool, depth: usize) std.mem.Allocator.Error!void {
+fn renderBlocksInto(out: *std.ArrayList(u8), a: std.mem.Allocator, md: []const u8, tight: bool, depth: usize, soft_wrap: bool, budget: *Budget) RenderError!void {
     if (depth > max_block_depth) {
         if (out.items.len > 0 and out.items[out.items.len - 1] != '\n') try out.append(a, '\n');
         try out.appendSlice(a, "<p>");
-        try renderInline(out, a, md);
+        try minline.renderInline(out, a, md, true, budget);
         try out.appendSlice(a, "</p>\n");
         return;
     }
     var pos: usize = 0;
     while (pos < md.len) {
+        // Charge one unit per block line and bail if the budget is blown — this
+        // is also where inline charges from the previous line get noticed.
+        budget.charge(1);
+        if (budget.blown()) return error.Hostile;
         const eol = lineEnd(md, pos);
         const line = md[pos..eol];
         const next = if (eol < md.len) eol + 1 else md.len;
@@ -118,7 +173,7 @@ fn renderBlocksInto(out: *std.ArrayList(u8), a: std.mem.Allocator, md: []const u
         // A fenced code block can interrupt a paragraph, so check it first.
         if (parseFenceOpen(md, pos)) |fo| {
             try tightSep(out, a, tight);
-            pos = try renderFence(out, a, md, fo);
+            pos = try renderFence(out, a, md, fo, budget);
             continue;
         }
 
@@ -127,7 +182,7 @@ fn renderBlocksInto(out: *std.ArrayList(u8), a: std.mem.Allocator, md: []const u
             try tightSep(out, a, tight);
             const d: u8 = '0' + @as(u8, @intCast(h.level));
             try out.appendSlice(a, &[_]u8{ '<', 'h', d, '>' });
-            try renderInline(out, a, h.content);
+            try minline.renderInline(out, a, h.content, true, budget);
             try out.appendSlice(a, &[_]u8{ '<', '/', 'h', d, '>', '\n' });
             pos = next;
             continue;
@@ -138,14 +193,14 @@ fn renderBlocksInto(out: *std.ArrayList(u8), a: std.mem.Allocator, md: []const u
         // non-empty, so it's checked before the paragraph branch.
         if (listMarkerAt(md, pos)) |lm| {
             try tightSep(out, a, tight);
-            pos = try renderList(out, a, md, pos, lm, depth);
+            pos = try renderList(out, a, md, pos, lm, depth, soft_wrap, budget);
             continue;
         }
 
         // A blockquote (also interrupts a paragraph).
         if (quoteMarkerLen(line) != null) {
             try tightSep(out, a, tight);
-            pos = try renderQuote(out, a, md, pos, depth);
+            pos = try renderQuote(out, a, md, pos, depth, soft_wrap, budget);
             continue;
         }
 
@@ -161,7 +216,7 @@ fn renderBlocksInto(out: *std.ArrayList(u8), a: std.mem.Allocator, md: []const u
                 if (isBlank(md[p..e2])) break;
                 p = if (e2 < md.len) e2 + 1 else md.len;
             }
-            try writeRawHtml(out, a, md[pos..p]);
+            try writeRawHtml(out, a, md[pos..p], budget);
             pos = p;
             continue;
         }
@@ -173,6 +228,7 @@ fn renderBlocksInto(out: *std.ArrayList(u8), a: std.mem.Allocator, md: []const u
         if (!tight) try out.appendSlice(a, "<p>");
         var p = pos;
         var first = true;
+        var reflow: std.ArrayList(u8) = .empty; // accumulates the joined paragraph (soft_wrap only)
         while (p < md.len) {
             const e2 = lineEnd(md, p);
             const l2 = md[p..e2];
@@ -181,11 +237,23 @@ fn renderBlocksInto(out: *std.ArrayList(u8), a: std.mem.Allocator, md: []const u
             if (atxHeading(l2) != null) break;
             if (listInterruptsAt(md, p)) break;
             if (quoteMarkerLen(l2) != null) break;
-            if (!first) try out.appendSlice(a, "<br>\n");
+            if (soft_wrap) {
+                // Reflow: wrapped source lines join with one space and the whole
+                // paragraph goes to the inline pass once (below), so an inline
+                // span can cross an author's line wrap and the text rewraps to
+                // the reader's width.
+                if (!first) try reflow.append(a, ' ');
+                try reflow.appendSlice(a, trimLine(l2));
+            } else {
+                // Hard-wrap dialect: each source line is its own line, joined by
+                // a <br>, and rendered inline on its own.
+                if (!first) try out.appendSlice(a, "<br>\n");
+                try minline.renderInline(out, a, trimLine(l2), true, budget);
+            }
             first = false;
-            try renderInline(out, a, trimLine(l2));
             p = if (e2 < md.len) e2 + 1 else md.len;
         }
+        if (soft_wrap) try minline.renderInline(out, a, reflow.items, true, budget);
         if (!tight) try out.appendSlice(a, "</p>\n");
         pos = p;
     }
@@ -201,6 +269,9 @@ fn tightSep(out: *std.ArrayList(u8), a: std.mem.Allocator, tight: bool) !void {
 
 // --- fenced code blocks (incl. the `quote` extension) -----------------------
 
+/// FenceOpen is fence.Open plus the document offset of the first content line,
+/// which the offset-based renderer needs and the line-based fence grammar can't
+/// supply on its own.
 const FenceOpen = struct {
     char: u8,
     count: usize,
@@ -209,37 +280,17 @@ const FenceOpen = struct {
     body_start: usize, // index of the first content line
 };
 
-/// parseFenceOpen recognizes a fence opening at md[pos] (line start): up to 3
-/// leading spaces, then >=3 of '`' or '~'. The info string is the rest of the
-/// line; the language is its first whitespace-delimited token.
+/// parseFenceOpen recognizes a fence opening at md[pos] (line start), delegating
+/// the grammar to fence.parseOpen (the shared, length-aware, depth-capped
+/// definition) and adding the document offset of the body.
 fn parseFenceOpen(md: []const u8, pos: usize) ?FenceOpen {
-    var i = pos;
-    var indent: usize = 0;
-    while (i < md.len and md[i] == ' ' and indent < 4) : (i += 1) {
-        indent += 1;
-    }
-    if (indent >= 4 or i >= md.len) return null;
-    const f = md[i];
-    if (f != '`' and f != '~') return null;
-    var count: usize = 0;
-    while (i < md.len and md[i] == f) : (i += 1) {
-        count += 1;
-    }
-    if (count < 3) return null;
-
-    const eol = lineEnd(md, i);
-    var info = md[i..eol];
-    // A backtick info string may not contain a backtick.
-    if (f == '`' and std.mem.indexOfScalar(u8, info, '`') != null) return null;
-    info = trimLine(info);
-    var lang = info;
-    if (std.mem.indexOfAny(u8, info, " \t")) |sp| lang = info[0..sp];
-
+    const eol = lineEnd(md, pos);
+    const o = fence.parseOpen(md[pos..eol]) orelse return null;
     return .{
-        .char = f,
-        .count = count,
-        .indent = indent,
-        .lang = lang,
+        .char = o.char,
+        .count = o.count,
+        .indent = o.indent,
+        .lang = o.lang,
         .body_start = if (eol < md.len) eol + 1 else md.len,
     };
 }
@@ -272,30 +323,15 @@ fn atxHeading(line: []const u8) ?Heading {
     return .{ .level = level, .content = content };
 }
 
-fn isClosingFence(line: []const u8, f: u8, n: usize) bool {
-    var i: usize = 0;
-    var indent: usize = 0;
-    while (i < line.len and line[i] == ' ' and indent < 4) : (i += 1) {
-        indent += 1;
-    }
-    if (indent >= 4) return false;
-    var count: usize = 0;
-    while (i < line.len and line[i] == f) : (i += 1) {
-        count += 1;
-    }
-    if (count < n) return false;
-    return trimLine(line[i..]).len == 0;
-}
-
 /// renderFence emits the code block and returns the position after the closing
 /// fence (or EOF when there is none — an unterminated fence runs to the end).
-fn renderFence(out: *std.ArrayList(u8), a: std.mem.Allocator, md: []const u8, fo: FenceOpen) !usize {
+fn renderFence(out: *std.ArrayList(u8), a: std.mem.Allocator, md: []const u8, fo: FenceOpen, budget: *Budget) !usize {
     var content_end = md.len;
     var after = md.len;
     var p = fo.body_start;
     while (p < md.len) {
         const e = lineEnd(md, p);
-        if (isClosingFence(md[p..e], fo.char, fo.count)) {
+        if (fence.isClose(md[p..e], fo.char, fo.count)) {
             content_end = p;
             after = if (e < md.len) e + 1 else md.len;
             break;
@@ -303,6 +339,7 @@ fn renderFence(out: *std.ArrayList(u8), a: std.mem.Allocator, md: []const u8, fo
         p = if (e < md.len) e + 1 else md.len;
     }
     const content = md[fo.body_start..content_end];
+    budget.charge(content.len); // the close-scan + per-byte escape is linear in the code body
 
     const is_quote = std.mem.eql(u8, fo.lang, "quote");
     if (is_quote) {
@@ -424,7 +461,7 @@ fn leadingSpaces(line: []const u8) usize {
 /// renderList consumes a whole list beginning at md[pos] (with first marker m0)
 /// and returns the position just past it. Items are collected as dedented
 /// content blocks and rendered recursively; tight/loose controls <p> wrapping.
-fn renderList(out: *std.ArrayList(u8), a: std.mem.Allocator, md: []const u8, pos: usize, m0: ListMarker, depth: usize) std.mem.Allocator.Error!usize {
+fn renderList(out: *std.ArrayList(u8), a: std.mem.Allocator, md: []const u8, pos: usize, m0: ListMarker, depth: usize, soft_wrap: bool, budget: *Budget) RenderError!usize {
     var items: std.ArrayList([]const u8) = .empty;
     var loose = false;
 
@@ -497,12 +534,12 @@ fn renderList(out: *std.ArrayList(u8), a: std.mem.Allocator, md: []const u8, pos
         var inner: std.ArrayList(u8) = .empty;
         if (loose) {
             try inner.append(a, '\n');
-            try renderBlocksInto(&inner, a, item, false, depth + 1);
+            try renderBlocksInto(&inner, a, item, false, depth + 1, soft_wrap, budget);
         } else {
             // we write a newline after a tight <li> iff its first child is not a
             // text paragraph (it's a nested list/quote/fence/heading).
             if (firstItemChildIsBlock(item)) try inner.append(a, '\n');
-            try renderBlocksInto(&inner, a, item, true, depth + 1);
+            try renderBlocksInto(&inner, a, item, true, depth + 1, soft_wrap, budget);
         }
         try out.appendSlice(a, "<li>");
         try out.appendSlice(a, inner.items);
@@ -563,7 +600,7 @@ fn quoteMarkerLen(line: []const u8) ?usize {
 /// renderQuote consumes a blockquote beginning at md[pos] and returns the
 /// position just past it. '>'-prefixed lines (and lazy paragraph-continuation
 /// lines, until a blank line) are stripped and rendered recursively.
-fn renderQuote(out: *std.ArrayList(u8), a: std.mem.Allocator, md: []const u8, pos: usize, depth: usize) std.mem.Allocator.Error!usize {
+fn renderQuote(out: *std.ArrayList(u8), a: std.mem.Allocator, md: []const u8, pos: usize, depth: usize, soft_wrap: bool, budget: *Budget) RenderError!usize {
     var inner: std.ArrayList(u8) = .empty;
     var p = pos;
     var last_was_text = false;
@@ -587,7 +624,7 @@ fn renderQuote(out: *std.ArrayList(u8), a: std.mem.Allocator, md: []const u8, po
     }
 
     try out.appendSlice(a, "<blockquote>\n");
-    try renderBlocksInto(out, a, inner.items, false, depth + 1);
+    try renderBlocksInto(out, a, inner.items, false, depth + 1, soft_wrap, budget);
     try out.appendSlice(a, "</blockquote>\n");
     return p;
 }
@@ -606,10 +643,11 @@ fn trimLine(line: []const u8) []const u8 {
 
 // --- raw HTML: escape everything but a locked, same-origin <img> ------------
 
-/// writeRawHtml emits a chunk of raw HTML: each recognized same-origin <img>
-/// is rebuilt from an attribute allowlist; everything else is HTML-escaped to
-/// literal text.
-fn writeRawHtml(out: *std.ArrayList(u8), a: std.mem.Allocator, raw: []const u8) !void {
+/// writeRawHtml emits a chunk of raw HTML: each recognized same-origin <img> or
+/// <video> is rebuilt from an attribute allowlist; everything else is
+/// HTML-escaped to literal text.
+fn writeRawHtml(out: *std.ArrayList(u8), a: std.mem.Allocator, raw: []const u8, budget: *Budget) !void {
+    budget.charge(raw.len); // one linear scan of the raw block
     var last: usize = 0;
     var i: usize = 0;
     while (i < raw.len) {
@@ -617,130 +655,17 @@ fn writeRawHtml(out: *std.ArrayList(u8), a: std.mem.Allocator, raw: []const u8) 
             i += 1;
             continue;
         }
-        if (safeImgAt(a, raw, i)) |img| {
+        const safe = mmedia.safeImgAt(a, raw, i) orelse mmedia.safeVideoAt(a, raw, i);
+        if (safe) |tag| {
             try escapeInto(out, a, raw[last..i]);
-            try out.appendSlice(a, img.html);
-            i = img.end;
-            last = img.end;
+            try out.appendSlice(a, tag.html);
+            i = tag.end;
+            last = tag.end;
         } else {
             i += 1;
         }
     }
     try escapeInto(out, a, raw[last..]);
-}
-
-const ImgAttrs = struct {
-    src: ?[]const u8 = null,
-    alt: ?[]const u8 = null,
-    title: ?[]const u8 = null,
-    width: ?[]const u8 = null,
-    height: ?[]const u8 = null,
-    end: usize = 0, // index just past '>'
-};
-
-const SafeImg = struct { html: []const u8, end: usize };
-
-/// safeImgAt parses a single <img …> beginning at raw[start] and, if its src
-/// is same-origin, returns the rebuilt locked tag plus the index past '>'.
-fn safeImgAt(a: std.mem.Allocator, raw: []const u8, start: usize) ?SafeImg {
-    const attrs = parseImgTagAt(raw, start) orelse return null;
-    const src = attrs.src orelse return null;
-    if (!isLocalImgUrl(std.mem.trim(u8, src, " \t\r\n"))) return null;
-
-    var buf: std.ArrayList(u8) = .empty;
-    appendSafeImg(&buf, a, attrs) catch return null;
-    return .{ .html = buf.items, .end = attrs.end };
-}
-
-fn appendSafeImg(buf: *std.ArrayList(u8), a: std.mem.Allocator, attrs: ImgAttrs) !void {
-    try buf.appendSlice(a, "<img");
-    try appendAttr(buf, a, "src", attrs.src.?);
-    if (attrs.alt) |v| try appendAttr(buf, a, "alt", v);
-    if (attrs.title) |v| try appendAttr(buf, a, "title", v);
-    if (attrs.width) |v| {
-        if (allDigits(v)) try appendAttr(buf, a, "width", v);
-    }
-    if (attrs.height) |v| {
-        if (allDigits(v)) try appendAttr(buf, a, "height", v);
-    }
-    try buf.append(a, '>');
-}
-
-fn appendAttr(buf: *std.ArrayList(u8), a: std.mem.Allocator, name: []const u8, val: []const u8) !void {
-    try buf.append(a, ' ');
-    try buf.appendSlice(a, name);
-    try buf.appendSlice(a, "=\"");
-    try escapeInto(buf, a, val);
-    try buf.append(a, '"');
-}
-
-/// parseImgTagAt parses one <img> tag at raw[start], capturing the allowlisted
-/// attributes (last value wins) and the index past '>'. Quotes are respected.
-fn parseImgTagAt(raw: []const u8, start: usize) ?ImgAttrs {
-    if (start + 4 >= raw.len or raw[start] != '<' or !eqlCI(raw[start + 1 .. start + 4], "img")) return null;
-    const d = raw[start + 4];
-    if (!isSpace(d) and d != '>' and d != '/') return null;
-
-    var attrs = ImgAttrs{};
-    var i = start + 4;
-    while (i < raw.len) {
-        const c = raw[i];
-        if (isSpace(c) or c == '/') {
-            i += 1;
-            continue;
-        }
-        if (c == '>') {
-            attrs.end = i + 1;
-            return attrs;
-        }
-        const name_start = i;
-        while (i < raw.len and isAttrNameChar(raw[i])) : (i += 1) {}
-        if (i == name_start) return null;
-        const name = raw[name_start..i];
-        while (i < raw.len and isSpace(raw[i])) : (i += 1) {}
-
-        var value: []const u8 = "";
-        if (i < raw.len and raw[i] == '=') {
-            i += 1;
-            while (i < raw.len and isSpace(raw[i])) : (i += 1) {}
-            if (i >= raw.len) return null;
-            const q = raw[i];
-            if (q == '"' or q == '\'') {
-                i += 1;
-                const vs = i;
-                while (i < raw.len and raw[i] != q) : (i += 1) {}
-                if (i >= raw.len) return null;
-                value = raw[vs..i];
-                i += 1;
-            } else {
-                const vs = i;
-                while (i < raw.len and !isSpace(raw[i]) and raw[i] != '>') : (i += 1) {}
-                value = raw[vs..i];
-            }
-        }
-        setImgAttr(&attrs, name, value);
-    }
-    return null;
-}
-
-fn setImgAttr(attrs: *ImgAttrs, name: []const u8, value: []const u8) void {
-    if (eqlCI(name, "src")) {
-        attrs.src = value;
-    } else if (eqlCI(name, "alt")) {
-        attrs.alt = value;
-    } else if (eqlCI(name, "title")) {
-        attrs.title = value;
-    } else if (eqlCI(name, "width")) {
-        attrs.width = value;
-    } else if (eqlCI(name, "height")) {
-        attrs.height = value;
-    }
-}
-
-/// isLocalImgUrl accepts only same-origin, root-relative URLs ("/…", but not
-/// "//…" or "/\…"), matching the Go renderer.
-fn isLocalImgUrl(src: []const u8) bool {
-    return src.len >= 2 and src[0] == '/' and src[1] != '/' and src[1] != '\\';
 }
 
 /// isHtmlBlockStart reports whether line opens a CommonMark type-7 HTML block:
@@ -773,674 +698,76 @@ fn htmlTagEnd(t: []const u8) ?usize {
     return null;
 }
 
-fn escapeInto(out: *std.ArrayList(u8), a: std.mem.Allocator, text: []const u8) !void {
-    for (text) |ch| {
-        switch (ch) {
-            '&' => try out.appendSlice(a, "&amp;"),
-            '<' => try out.appendSlice(a, "&lt;"),
-            '>' => try out.appendSlice(a, "&gt;"),
-            '"' => try out.appendSlice(a, "&quot;"),
-            else => try out.append(a, ch),
-        }
-    }
+// ── tests ────────────────────────────────────────────────────────────────────
+
+const testing = std.testing;
+
+test "render: a same-origin <video> becomes a locked player" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const html = try render(arena.allocator(), "<video src=\"/chat/c/1_3/yo/uploads/abc.mp4\"></video>");
+    try testing.expect(std.mem.indexOf(u8, html, "<video controls preload=\"metadata\" src=\"/chat/c/1_3/yo/uploads/abc.mp4\"></video>") != null);
 }
 
-// --- inline rendering (text + img + links + autolinks) ----------------------
-
-// An inline node. The renderInline pipeline is: tokenize text into nodes
-// (literal text, pre-rendered html for code/img/link/autolink, and `*`/`_`
-// delimiter runs) → resolve emphasis by the CommonMark delimiter-stack
-// algorithm (inserting open/close marker nodes) → emit. Nodes live in one
-// arraylist; the inline order is a doubly-linked list over `prev`/`next`, and
-// the delimiter stack is a second linked list over `dprev`/`dnext`.
-const IKind = enum { text, html, delim, open, close };
-
-const Node = struct {
-    kind: IKind,
-    s: []const u8 = "", // text: raw (escape on emit); html: pre-rendered (emit as-is)
-    ch: u8 = 0, // delim char
-    count: usize = 0, // delim: remaining (unconsumed) delimiters
-    orig: usize = 0, // delim: original run length (for the rule of 3)
-    can_open: bool = false,
-    can_close: bool = false,
-    use: usize = 0, // open/close marker: 1 = <em>, 2 = <strong>
-    prev: ?u32 = null,
-    next: ?u32 = null,
-    dprev: ?u32 = null, // delimiter-stack links (delim nodes only)
-    dnext: ?u32 = null,
-};
-
-const Inline = struct {
-    nodes: std.ArrayList(Node) = .empty,
-    head: ?u32 = null,
-    tail: ?u32 = null,
-    dhead: ?u32 = null,
-    dtail: ?u32 = null,
-
-    fn append(self: *Inline, a: std.mem.Allocator, n: Node) !u32 {
-        const idx: u32 = @intCast(self.nodes.items.len);
-        var node = n;
-        node.prev = self.tail;
-        node.next = null;
-        try self.nodes.append(a, node);
-        if (self.tail) |t| self.nodes.items[t].next = idx;
-        self.tail = idx;
-        if (self.head == null) self.head = idx;
-        return idx;
-    }
-
-    fn appendDelim(self: *Inline, a: std.mem.Allocator, n: Node) !void {
-        const idx = try self.append(a, n);
-        self.nodes.items[idx].dprev = self.dtail;
-        if (self.dtail) |t| self.nodes.items[t].dnext = idx;
-        self.dtail = idx;
-        if (self.dhead == null) self.dhead = idx;
-    }
-
-    // insertAfter splices a fresh node into the inline list just after `at`.
-    fn insertAfter(self: *Inline, a: std.mem.Allocator, at: u32, n: Node) !void {
-        const idx: u32 = @intCast(self.nodes.items.len);
-        var node = n;
-        node.prev = at;
-        node.next = self.nodes.items[at].next;
-        try self.nodes.append(a, node);
-        if (self.nodes.items[idx].next) |nx| self.nodes.items[nx].prev = idx else self.tail = idx;
-        self.nodes.items[at].next = idx;
-    }
-
-    // insertBefore splices a fresh node into the inline list just before `at`.
-    fn insertBefore(self: *Inline, a: std.mem.Allocator, at: u32, n: Node) !void {
-        const idx: u32 = @intCast(self.nodes.items.len);
-        var node = n;
-        node.next = at;
-        node.prev = self.nodes.items[at].prev;
-        try self.nodes.append(a, node);
-        if (self.nodes.items[idx].prev) |pv| self.nodes.items[pv].next = idx else self.head = idx;
-        self.nodes.items[at].prev = idx;
-    }
-
-    // unlinkDelim removes a node from the delimiter stack (its inline-list place
-    // and text are untouched — leftover delimiter chars still emit).
-    fn unlinkDelim(self: *Inline, idx: u32) void {
-        const dp = self.nodes.items[idx].dprev;
-        const dn = self.nodes.items[idx].dnext;
-        if (dp) |p| self.nodes.items[p].dnext = dn else self.dhead = dn;
-        if (dn) |n| self.nodes.items[n].dprev = dp else self.dtail = dp;
-    }
-};
-
-/// renderInline renders one line of inline content: escapes plain text and
-/// recognizes inline <img>, code spans, markdown links [t](u), GFM bare-URL/
-/// email autolinks, and `*`/`_`/`**` emphasis. target="_blank" on external
-/// links is added by the linkifyMsgRefs post-pass (mirroring Go).
-fn renderInline(out: *std.ArrayList(u8), a: std.mem.Allocator, text: []const u8) std.mem.Allocator.Error!void {
-    var inl = Inline{};
-
-    var run_start: usize = 0;
-    var i: usize = 0;
-    // Monotonic scan cursors: the first ']' / ')' at or after a position, and a
-    // floor below which no email autolink can start, all only ever move forward.
-    // They keep mdLinkAt / autolinkAt from re-scanning the same suffix from every
-    // '[' or post-`_` boundary — the difference between O(n²) and O(n) on hostile
-    // input like "[[[[…", "[]([]([](…", or "a_b_a_b…" (Steve, 2026-06-19).
-    var rb: usize = std.mem.indexOfScalarPos(u8, text, 0, ']') orelse text.len;
-    var rp: usize = std.mem.indexOfScalarPos(u8, text, 0, ')') orelse text.len;
-    var email_dead: usize = 0;
-    while (i < text.len) {
-        const c = text[i];
-        var consumed = false;
-        if (c == '<') {
-            if (safeImgAt(a, text, i)) |img| {
-                try flushText(&inl, a, text[run_start..i]);
-                _ = try inl.append(a, .{ .kind = .html, .s = img.html });
-                i = img.end;
-                consumed = true;
-            }
-        } else if (c == '`') {
-            if (codeSpanAt(text, i)) |cs| {
-                try flushText(&inl, a, text[run_start..i]);
-                var buf: std.ArrayList(u8) = .empty;
-                try buf.appendSlice(a, "<code>");
-                try escapeInto(&buf, a, codeSpanContent(text[cs.content_start..cs.content_end]));
-                try buf.appendSlice(a, "</code>");
-                _ = try inl.append(a, .{ .kind = .html, .s = buf.items });
-                i = cs.end;
-                consumed = true;
-            } else {
-                // No equal-length closing run: the whole opening run is
-                // literal. Skip past it so we don't re-enter at an interior
-                // backtick and let a shorter sub-run open a spurious span —
-                // CommonMark treats a backtick run as an atomic unit. The run
-                // stays pending as text (backticks aren't HTML-special). This
-                // is what keeps an inline ``` (e.g. discussing fences) from
-                // mangling the rest of the paragraph.
-                var n: usize = 0;
-                while (i + n < text.len and text[i + n] == '`') : (n += 1) {}
-                i += n;
-                continue;
-            }
-        } else if (c == '[') {
-            if (try mdLinkAt(a, text, i, &rb, &rp)) |lk| {
-                try flushText(&inl, a, text[run_start..i]);
-                _ = try inl.append(a, .{ .kind = .html, .s = lk.html });
-                i = lk.end;
-                consumed = true;
-            }
-        } else if (c == '*' or c == '_') {
-            try flushText(&inl, a, text[run_start..i]);
-            var n: usize = 0;
-            while (i + n < text.len and text[i + n] == c) : (n += 1) {}
-            const fl = flanking(text, i, i + n);
-            const can_open = if (c == '*') fl.left else fl.left and (!fl.right or fl.before_punct);
-            const can_close = if (c == '*') fl.right else fl.right and (!fl.left or fl.after_punct);
-            try inl.appendDelim(a, .{
-                .kind = .delim,
-                .s = text[i .. i + n],
-                .ch = c,
-                .count = n,
-                .orig = n,
-                .can_open = can_open,
-                .can_close = can_close,
-            });
-            i += n;
-            consumed = true;
-        } else if (autolinkBoundary(text, i)) {
-            if (autolinkAt(text, i, &email_dead)) |al| {
-                try flushText(&inl, a, text[run_start..i]);
-                var buf: std.ArrayList(u8) = .empty;
-                try emitAutolink(&buf, a, text[i..al.end], al.kind);
-                _ = try inl.append(a, .{ .kind = .html, .s = buf.items });
-                i = al.end;
-                consumed = true;
-            }
-        }
-        if (consumed) {
-            run_start = i;
-        } else {
-            i += 1;
-        }
-    }
-    try flushText(&inl, a, text[run_start..]);
-
-    processEmphasis(&inl, a);
-    try emitInline(out, a, &inl);
+test "render: video attrs are allowlisted (onerror dropped, digit dims kept)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const html = try render(arena.allocator(), "<video src=\"/u/x.webm\" width=\"320\" onerror=\"alert(1)\"></video>");
+    try testing.expect(std.mem.indexOf(u8, html, "onerror") == null);
+    try testing.expect(std.mem.indexOf(u8, html, "width=\"320\"") != null);
 }
 
-fn flushText(inl: *Inline, a: std.mem.Allocator, s: []const u8) !void {
-    if (s.len == 0) return;
-    _ = try inl.append(a, .{ .kind = .text, .s = s });
+test "render: a cross-origin or unclosed <video> is escaped, not embedded" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const off = try render(arena.allocator(), "<video src=\"https://evil/x.mp4\"></video>");
+    try testing.expect(std.mem.indexOf(u8, off, "<video") == null);
+    try testing.expect(std.mem.indexOf(u8, off, "&lt;video") != null);
+    const unclosed = try render(arena.allocator(), "<video src=\"/u/x.mp4\">"); // no </video>
+    try testing.expect(std.mem.indexOf(u8, unclosed, "<video") == null);
 }
 
-fn emitInline(out: *std.ArrayList(u8), a: std.mem.Allocator, inl: *Inline) !void {
-    var cur = inl.head;
-    while (cur) |idx| {
-        const n = inl.nodes.items[idx];
-        switch (n.kind) {
-            .text => try escapeInto(out, a, n.s),
-            .html => try out.appendSlice(a, n.s),
-            .delim => {
-                var k: usize = 0;
-                while (k < n.count) : (k += 1) try out.append(a, n.ch);
-            },
-            .open => try out.appendSlice(a, if (n.use == 2) "<strong>" else "<em>"),
-            .close => try out.appendSlice(a, if (n.use == 2) "</strong>" else "</em>"),
-        }
-        cur = n.next;
-    }
+test "renderTrustedReflow: an inline span crosses a source wrap; prose reflows (no <br>)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const html = try renderTrustedReflow(arena.allocator(), "A **bold phrase that\nspans two lines** here.");
+    // The wrap joins with a space, so the emphasis run closes and the text reflows.
+    try testing.expect(std.mem.indexOf(u8, html, "<strong>bold phrase that spans two lines</strong>") != null);
+    try testing.expect(std.mem.indexOf(u8, html, "<br>") == null);
+    try testing.expect(std.mem.indexOf(u8, html, "**") == null);
 }
 
-const Flank = struct { left: bool, right: bool, before_punct: bool, after_punct: bool };
-
-/// flanking computes the CommonMark left/right-flanking flags for the delimiter
-/// run text[s..e]. Run start/end of the line counts as whitespace.
-fn flanking(text: []const u8, s: usize, e: usize) Flank {
-    const before: u8 = if (s == 0) ' ' else text[s - 1];
-    const after: u8 = if (e >= text.len) ' ' else text[e];
-    const before_ws = isSpace(before);
-    const after_ws = isSpace(after);
-    const before_punct = isPunct(before);
-    const after_punct = isPunct(after);
-    const left = !after_ws and (!after_punct or before_ws or before_punct);
-    const right = !before_ws and (!before_punct or after_ws or after_punct);
-    return .{ .left = left, .right = right, .before_punct = before_punct, .after_punct = after_punct };
+test "renderTrusted (hard-wrap dialect): a source wrap stays a <br>, inline is line-scoped" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const html = try renderTrusted(arena.allocator(), "A **bold phrase that\nspans two lines** here.");
+    // Chat/docs contract: every newline is a hard break and a span can't cross it.
+    try testing.expect(std.mem.indexOf(u8, html, "<br>") != null);
+    try testing.expect(std.mem.indexOf(u8, html, "<strong>") == null);
 }
 
-/// processEmphasis resolves `*`/`_` delimiter runs into <em>/<strong> by the
-/// CommonMark delimiter-stack algorithm (including the "rule of 3"), inserting
-/// open/close marker nodes around the matched spans.
-fn processEmphasis(inl: *Inline, a: std.mem.Allocator) void {
-    // openers_bottom[len % 3][char], char: '*' = 0, '_' = 1. null = stack bottom.
-    var openers_bottom = [_][2]?u32{.{ null, null }} ** 3;
-
-    var closer = inl.dhead;
-    while (closer) |ci| {
-        if (!inl.nodes.items[ci].can_close) {
-            closer = inl.nodes.items[ci].dnext;
-            continue;
-        }
-        const cch = inl.nodes.items[ci].ch;
-        const ob_index: usize = if (cch == '*') 0 else 1;
-        const bottom = openers_bottom[inl.nodes.items[ci].count % 3][ob_index];
-
-        // Look back for a matching opener.
-        var opener = inl.nodes.items[ci].dprev;
-        var opener_found = false;
-        while (opener) |oi| {
-            if (oi == bottom) break;
-            const on = inl.nodes.items[oi];
-            if (on.can_open and on.ch == cch) {
-                const cn = inl.nodes.items[ci];
-                const odd = (cn.can_open or on.can_close) and
-                    (cn.orig % 3 != 0) and ((on.orig + cn.orig) % 3 == 0);
-                if (!odd) {
-                    opener_found = true;
-                    break;
-                }
-            }
-            opener = on.dprev;
-        }
-
-        const old_closer = ci;
-        if (opener_found) {
-            const oi = opener.?;
-            const use: usize = if (inl.nodes.items[oi].count >= 2 and inl.nodes.items[ci].count >= 2) 2 else 1;
-
-            // Wrap the span: open marker after the opener, close marker before
-            // the closer. Insertion is append-based, so capture neighbors first.
-            inl.insertAfter(a, oi, .{ .kind = .open, .use = use }) catch return;
-            inl.insertBefore(a, ci, .{ .kind = .close, .use = use }) catch return;
-
-            inl.nodes.items[oi].count -= use;
-            inl.nodes.items[ci].count -= use;
-
-            // Drop every delimiter strictly between opener and closer.
-            inl.nodes.items[oi].dnext = ci;
-            inl.nodes.items[ci].dprev = oi;
-
-            if (inl.nodes.items[oi].count == 0) inl.unlinkDelim(oi);
-            if (inl.nodes.items[ci].count == 0) {
-                const nxt = inl.nodes.items[ci].dnext;
-                inl.unlinkDelim(ci);
-                closer = nxt;
-            }
-            // closer with leftover delimiters stays; the loop re-examines it.
-        } else {
-            closer = inl.nodes.items[ci].dnext;
-            openers_bottom[inl.nodes.items[old_closer].count % 3][ob_index] = inl.nodes.items[old_closer].dprev;
-            if (!inl.nodes.items[old_closer].can_open) inl.unlinkDelim(old_closer);
-        }
-    }
+test "budget: a blown ceiling aborts the parse with error.Hostile" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    // A ceiling far below the work this text needs forces the abort path —
+    // the mechanism a super-linear regression would trip (proven against a
+    // fault-injected O(n^2) cursor; here we exercise the abort directly).
+    var budget = Budget{ .ceiling = 3 };
+    try testing.expectError(error.Hostile, renderBlocks(arena.allocator(), "hello world, this is several words", false, &budget));
 }
 
-/// autolinkBoundary: a GFM autolink may start only at the beginning of the
-/// run or after whitespace or one of * _ ~ (.
-fn autolinkBoundary(text: []const u8, i: usize) bool {
-    if (i == 0) return true;
-    const p = text[i - 1];
-    return isSpace(p) or p == '*' or p == '_' or p == '~' or p == '(';
-}
-
-const AutoKind = enum { url, www, email };
-const Autolink = struct { end: usize, kind: AutoKind };
-
-/// autolinkAt detects a GFM autolink starting at text[i] and returns the index
-/// just past it (after trailing-punctuation trimming), or null.
-/// `email_dead` is renderInline's monotonic floor: no email autolink can start
-/// at any index below it. Without it, an email-local char that's also an
-/// autolink boundary ('_') makes emailEnd re-scan the whole email-local run from
-/// every '_' — O(n²) on "a_b_a_b…". When emailEnd fails, the entire local run is
-/// equally dead (every position in it scans to the same run end with the same
-/// outcome), so we advance the floor past it: O(n) total.
-fn autolinkAt(text: []const u8, i: usize, email_dead: *usize) ?Autolink {
-    if (startsWithCI(text[i..], "http://") or startsWithCI(text[i..], "https://")) {
-        const end = urlEnd(text, i) orelse return null;
-        return .{ .end = end, .kind = .url };
-    }
-    if (startsWithCI(text[i..], "www.")) {
-        const end = urlEnd(text, i) orelse return null;
-        return .{ .end = end, .kind = .www };
-    }
-    if (i >= email_dead.*) {
-        if (emailEnd(text, i)) |end| return .{ .end = end, .kind = .email };
-        var j = i;
-        while (j < text.len and isEmailLocalChar(text[j])) : (j += 1) {}
-        email_dead.* = if (j > i) j else i + 1;
-    }
-    return null;
-}
-
-/// urlEnd consumes URL characters from start (up to whitespace or '<') then
-/// trims GFM trailing punctuation and unbalanced ')'.
-fn urlEnd(text: []const u8, start: usize) ?usize {
-    var end = start;
-    while (end < text.len and !isSpace(text[end]) and text[end] != '<') : (end += 1) {}
-    // The DOMAIN (host, after the scheme and before any port/path/query) must
-    // contain a '.', per GFM. A '.' in the path doesn't count — so
-    // http://localhost:9100/x.md is not an autolink, but http://a.com/x is.
-    var dstart = start;
-    if (std.mem.indexOf(u8, text[start..end], "://")) |p| dstart = start + p + 3;
-    var dend = dstart;
-    while (dend < end and text[dend] != '/' and text[dend] != '?' and
-        text[dend] != '#' and text[dend] != ':') : (dend += 1)
-    {}
-    if (std.mem.indexOfScalar(u8, text[dstart..dend], '.') == null) return null;
-    while (end > start) {
-        const c = text[end - 1];
-        switch (c) {
-            '?', '!', '.', ',', ':', '*', '_', '~', '\'', '"' => end -= 1,
-            ')' => {
-                if (countByte(text[start..end], ')') > countByte(text[start..end], '(')) {
-                    end -= 1;
-                } else break;
-            },
-            else => break,
-        }
-    }
-    if (end <= start + 4) return null; // nothing meaningful left
-    return end;
-}
-
-/// emailEnd matches a GFM email autolink (local@domain.tld) at text[i].
-fn emailEnd(text: []const u8, i: usize) ?usize {
-    var j = i;
-    while (j < text.len and isEmailLocalChar(text[j])) : (j += 1) {}
-    if (j == i or j >= text.len or text[j] != '@') return null;
-    j += 1;
-    const domain_start = j;
-    while (j < text.len and (isAsciiAlnum(text[j]) or text[j] == '.' or text[j] == '-' or text[j] == '_')) : (j += 1) {}
-    const domain = text[domain_start..j];
-    if (domain.len == 0 or std.mem.indexOfScalar(u8, domain, '.') == null) return null;
-    // A trailing '.' or '-' or '_' is not part of the email.
-    while (j > domain_start and (text[j - 1] == '.' or text[j - 1] == '-' or text[j - 1] == '_')) : (j -= 1) {}
-    return j;
-}
-
-fn emitAutolink(out: *std.ArrayList(u8), a: std.mem.Allocator, link: []const u8, kind: AutoKind) !void {
-    try out.appendSlice(a, "<a href=\"");
-    switch (kind) {
-        .url => try escapeInto(out, a, link),
-        .www => {
-            try out.appendSlice(a, "http://");
-            try escapeInto(out, a, link);
-        },
-        .email => {
-            try out.appendSlice(a, "mailto:");
-            try escapeInto(out, a, link);
-        },
-    }
-    try out.appendSlice(a, "\">");
-    try escapeInto(out, a, link);
-    try out.appendSlice(a, "</a>");
-}
-
-const CodeSpan = struct { content_start: usize, content_end: usize, end: usize };
-
-/// codeSpanAt matches a backtick code span at text[i]: an opening run of N
-/// backticks closed by a run of exactly N backticks. Returns null (literal
-/// backticks) if there's no matching close.
-fn codeSpanAt(text: []const u8, i: usize) ?CodeSpan {
-    var n: usize = 0;
-    while (i + n < text.len and text[i + n] == '`') : (n += 1) {}
-    const content_start = i + n;
-    var k = content_start;
-    while (k < text.len) {
-        if (text[k] != '`') {
-            k += 1;
-            continue;
-        }
-        var m: usize = 0;
-        while (k + m < text.len and text[k + m] == '`') : (m += 1) {}
-        if (m == n) return .{ .content_start = content_start, .content_end = k, .end = k + m };
-        k += m; // a run of the wrong length is part of the content
-    }
-    return null;
-}
-
-/// codeSpanContent applies CommonMark's trimming: if the content both begins
-/// and ends with a space and isn't all spaces, one space is stripped each end.
-fn codeSpanContent(content: []const u8) []const u8 {
-    if (content.len >= 2 and content[0] == ' ' and content[content.len - 1] == ' ' and
-        std.mem.indexOfNone(u8, content, " ") != null)
-    {
-        return content[1 .. content.len - 1];
-    }
-    return content;
-}
-
-const MdLink = struct { html: []const u8, end: usize };
-
-/// mdLinkAt parses a markdown link [text](url) at text[i] (text[i] == '['),
-/// or null if it's not a well-formed link. `rb` / `rp` are renderInline's
-/// monotonic ']' / ')' cursors: each only ever advances, so the forward scans
-/// here cost O(n) total across all '[' rather than O(n²) on "[[[[…" / "[](…".
-/// `rb` lands on the first ']' at >= i+1 and `rp` on the first ')' at >= open_p+1
-/// — exactly what indexOfScalarPos found before, just never re-scanned.
-fn mdLinkAt(a: std.mem.Allocator, text: []const u8, i: usize, rb: *usize, rp: *usize) std.mem.Allocator.Error!?MdLink {
-    while (rb.* < text.len and rb.* < i + 1) {
-        rb.* = std.mem.indexOfScalarPos(u8, text, rb.* + 1, ']') orelse text.len;
-    }
-    if (rb.* >= text.len) return null;
-    const close_br = rb.*;
-    if (close_br + 1 >= text.len or text[close_br + 1] != '(') return null;
-    const open_p = close_br + 1;
-    while (rp.* < text.len and rp.* < open_p + 1) {
-        rp.* = std.mem.indexOfScalarPos(u8, text, rp.* + 1, ')') orelse text.len;
-    }
-    if (rp.* >= text.len) return null;
-    const close_p = rp.*;
-
-    const label = text[i + 1 .. close_br];
-    const url = text[open_p + 1 .. close_p];
-
+test "budget: linear content never trips, regardless of size" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // The ceiling is per_byte*len+base, and a linear parser spends ~k*len with
+    // k well under per_byte — so a big but ordinary message renders, never the
+    // malformed placeholder. (This is the whole point: density/size don't trip
+    // it, only super-linear work does.)
     var buf: std.ArrayList(u8) = .empty;
-    try buf.appendSlice(a, "<a href=\"");
-    if (!isDangerousUrl(url)) try escapeInto(&buf, a, url);
-    try buf.appendSlice(a, "\">");
-    try renderInline(&buf, a, label);
-    try buf.appendSlice(a, "</a>");
-    return .{ .html = buf.items, .end = close_p + 1 };
-}
-
-/// isDangerousUrl blocks the dangerous URL schemes javascript:, vbscript:,
-/// file:, and data: except for image data URIs.
-fn isDangerousUrl(url: []const u8) bool {
-    if (startsWithCI(url, "data:image/")) {
-        const v = url[11..];
-        if (startsWithCI(v, "png") or startsWithCI(v, "gif") or startsWithCI(v, "jpeg") or
-            startsWithCI(v, "webp") or startsWithCI(v, "svg")) return false;
-        return true;
-    }
-    return startsWithCI(url, "javascript:") or startsWithCI(url, "vbscript:") or
-        startsWithCI(url, "file:") or startsWithCI(url, "data:");
-}
-
-fn isEmailLocalChar(c: u8) bool {
-    return isAsciiAlnum(c) or c == '.' or c == '_' or c == '+' or c == '-';
-}
-
-fn countByte(s: []const u8, b: u8) usize {
-    var n: usize = 0;
-    for (s) |c| {
-        if (c == b) n += 1;
-    }
-    return n;
-}
-
-// --- MSG_ reference linkifier (post-pass over rendered HTML) -----------------
-
-/// linkifyMsgRefs rewrites MSG_<slug>_<n> tokens in HTML text into reference
-/// links, skipping the contents of <code>, <pre>, and <a> elements — the same
-/// single tokenizing walk (tags vs. text) as the Go linkifyMsgRefs.
-fn linkifyMsgRefs(a: std.mem.Allocator, html: []const u8) ![]const u8 {
-    var out: std.ArrayList(u8) = .empty;
-    var skip: usize = 0;
     var i: usize = 0;
-    while (i < html.len) {
-        if (html[i] == '<') {
-            const end = std.mem.indexOfScalarPos(u8, html, i, '>') orelse {
-                try out.appendSlice(a, html[i..]);
-                break;
-            };
-            var tag = html[i .. end + 1];
-            if (startsWithCI(tag, "<a ")) tag = try openExternalInNewTab(a, tag);
-            try out.appendSlice(a, tag);
-            if (tagOpensSkip(tag)) {
-                skip += 1;
-            } else if (tagClosesSkip(tag) and skip > 0) {
-                skip -= 1;
-            }
-            i = end + 1;
-            continue;
-        }
-        const next = std.mem.indexOfScalarPos(u8, html, i, '<') orelse html.len;
-        const text = html[i..next];
-        if (skip == 0) {
-            try linkifyText(&out, a, text);
-        } else {
-            try out.appendSlice(a, text);
-        }
-        i = next;
-    }
-    return out.toOwnedSlice(a);
-}
-
-/// openExternalInNewTab adds target="_blank" rel="noopener" to an <a> whose
-/// href is fully qualified (scheme://).
-fn openExternalInNewTab(a: std.mem.Allocator, tag: []const u8) ![]const u8 {
-    const href = attrValue(tag, "href") orelse return tag;
-    if (!isExternalHref(href)) return tag;
-    var buf: std.ArrayList(u8) = .empty;
-    try buf.appendSlice(a, tag[0 .. tag.len - 1]); // drop trailing '>'
-    try buf.appendSlice(a, " target=\"_blank\" rel=\"noopener\">");
-    return buf.items;
-}
-
-fn attrValue(tag: []const u8, attr: []const u8) ?[]const u8 {
-    var pat: [16]u8 = undefined;
-    if (attr.len + 2 > pat.len) return null;
-    @memcpy(pat[0..attr.len], attr);
-    pat[attr.len] = '=';
-    pat[attr.len + 1] = '"';
-    const k = std.mem.indexOf(u8, tag, pat[0 .. attr.len + 2]) orelse return null;
-    const start = k + attr.len + 2;
-    const q = std.mem.indexOfScalarPos(u8, tag, start, '"') orelse return null;
-    return tag[start..q];
-}
-
-fn isExternalHref(href: []const u8) bool {
-    const p = std.mem.indexOf(u8, href, "://") orelse return false;
-    if (p == 0 or !isAsciiAlpha(href[0])) return false;
-    for (href[1..p]) |c| {
-        if (!isAsciiAlnum(c) and c != '+' and c != '.' and c != '-') return false;
-    }
-    return true;
-}
-
-fn tagOpensSkip(tag: []const u8) bool {
-    return startsWithCI(tag, "<code") or startsWithCI(tag, "<pre") or startsWithCI(tag, "<a ");
-}
-
-fn tagClosesSkip(tag: []const u8) bool {
-    return startsWithCI(tag, "</code") or startsWithCI(tag, "</pre") or startsWithCI(tag, "</a");
-}
-
-fn linkifyText(out: *std.ArrayList(u8), a: std.mem.Allocator, text: []const u8) !void {
-    var i: usize = 0;
-    while (i < text.len) {
-        if (msgRefEnd(text, i)) |end| {
-            const slug = text[i + 4 .. end]; // group: <slug>_<n>
-            try out.appendSlice(a, "<a href=\"#msg-");
-            try out.appendSlice(a, slug);
-            try out.appendSlice(a, "\" class=\"msg-ref\">MSG_");
-            try out.appendSlice(a, slug);
-            try out.appendSlice(a, "</a>");
-            i = end;
-        } else {
-            try out.append(a, text[i]);
-            i += 1;
-        }
-    }
-}
-
-/// msgRefEnd matches \bMSG_([A-Za-z0-9-]+_[0-9]+)\b at text[i], returning the
-/// index just past the match, or null.
-fn msgRefEnd(text: []const u8, i: usize) ?usize {
-    if (i + 4 > text.len or !std.mem.eql(u8, text[i .. i + 4], "MSG_")) return null;
-    if (i > 0 and isWordChar(text[i - 1])) return null; // \b before
-    var j = i + 4;
-    const slug_start = j;
-    while (j < text.len and isSlugChar(text[j])) : (j += 1) {}
-    if (j == slug_start) return null;
-    if (j >= text.len or text[j] != '_') return null;
-    j += 1;
-    const dig_start = j;
-    while (j < text.len and isDigit(text[j])) : (j += 1) {}
-    if (j == dig_start) return null;
-    if (j < text.len and isWordChar(text[j])) return null; // \b after
-    return j;
-}
-
-// --- small char/string helpers ----------------------------------------------
-
-fn isWordChar(c: u8) bool {
-    return isAsciiAlnum(c) or c == '_';
-}
-
-fn isSlugChar(c: u8) bool {
-    return isAsciiAlnum(c) or c == '-';
-}
-
-fn isAttrNameChar(c: u8) bool {
-    return isAsciiAlnum(c) or c == '-' or c == '_' or c == ':';
-}
-
-fn isDigit(c: u8) bool {
-    return c >= '0' and c <= '9';
-}
-
-fn isAsciiAlpha(c: u8) bool {
-    return (c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z');
-}
-
-fn isAsciiAlnum(c: u8) bool {
-    return isAsciiAlpha(c) or isDigit(c);
-}
-
-fn isSpace(c: u8) bool {
-    return c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == 0x0c;
-}
-
-/// isPunct reports whether c is an ASCII punctuation char (CommonMark's
-/// definition), used by the emphasis flanking rules.
-fn isPunct(c: u8) bool {
-    return (c >= '!' and c <= '/') or (c >= ':' and c <= '@') or
-        (c >= '[' and c <= '`') or (c >= '{' and c <= '~');
-}
-
-fn allDigits(s: []const u8) bool {
-    if (s.len == 0) return false;
-    for (s) |c| {
-        if (!isDigit(c)) return false;
-    }
-    return true;
-}
-
-fn eqlCI(s: []const u8, lower_lit: []const u8) bool {
-    if (s.len != lower_lit.len) return false;
-    for (s, lower_lit) |c, l| {
-        if (lower(c) != l) return false;
-    }
-    return true;
-}
-
-fn startsWithCI(haystack: []const u8, prefix: []const u8) bool {
-    if (haystack.len < prefix.len) return false;
-    for (prefix, 0..) |p, n| {
-        if (lower(haystack[n]) != lower(p)) return false;
-    }
-    return true;
-}
-
-fn lower(c: u8) u8 {
-    return if (c >= 'A' and c <= 'Z') c + 32 else c;
+    while (i < 4000) : (i += 1) try buf.appendSlice(a, "word **bold** [t](http://x.com) ");
+    const html = try render(a, buf.items);
+    try testing.expect(!std.mem.eql(u8, html, malformed_html));
+    try testing.expect(hostileReason(a, buf.items) == null);
 }

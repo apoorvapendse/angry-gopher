@@ -11,8 +11,7 @@ scenario turn_1_hint
     - A♣ A♦ A♥
     - 2♣ 3♦ 4♣ 5♥ 6♠ 7♥
   expect_steps:
-    - place [4♠] from hand
-    - push [4♠] onto HELPER [K♠ A♠ 2♠ 3♠] → [K♠ A♠ 2♠ 3♠ 4♠]
+    - play 4♠ from hand onto K♠ A♠ 2♠ 3♠
 
 scenario turn_2_hint
   op: hint_for_hand
@@ -26,9 +25,8 @@ scenario turn_2_hint
     - 2♣ 3♦ 4♣ 5♥ 6♠ 7♥
     - J♦' Q♦'
   expect_steps:
-    - place [4♠] from hand
-    - peel T♦ from HELPER [T♦ J♦ Q♦ K♦], absorb onto [J♦' Q♦'] → [T♦ J♦' Q♦'] [→COMPLETE]
-    - push [4♠] onto HELPER [K♠ A♠ 2♠ 3♠] → [K♠ A♠ 2♠ 3♠ 4♠]
+    - peel T♦ from T♦ J♦ Q♦ K♦ onto J♦ Q♦
+    - play 4♠ from hand onto K♠ A♠ 2♠ 3♠
 
 scenario turn_3_hint
   op: hint_for_hand
@@ -43,7 +41,6 @@ scenario turn_3_hint
     - J♦' Q♦'
     - 4♠
   expect_steps:
-    - place [4♣'] from hand
-    - peel K♦ from HELPER [T♦ J♦ Q♦ K♦], absorb onto [J♦' Q♦'] → [J♦' Q♦' K♦] [→COMPLETE]
-    - push [4♠] onto HELPER [K♠ A♠ 2♠ 3♠] → [K♠ A♠ 2♠ 3♠ 4♠]
-    - splice [4♣'] into HELPER [2♣ 3♦ 4♣ 5♥ 6♠ 7♥] → [2♣ 3♦ 4♣'] + [4♣ 5♥ 6♠ 7♥]
+    - peel K♦ from T♦ J♦ Q♦ K♦ onto J♦ Q♦
+    - push 4♠ onto K♠ A♠ 2♠ 3♠
+    - splice 4♣ from hand into 2♣ 3♦ 4♣ 5♥ 6♠ 7♥

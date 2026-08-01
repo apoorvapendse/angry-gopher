@@ -17,7 +17,7 @@
 //!   POST /chat/docs/post          append the doc to the default chat partner → JSON
 //!   GET  /chat/docs.js            the client bundle (served by chat.serveAsset, public)
 //!
-//! The page chrome (head + top bar + .app-body-wrap) is chat.writeChrome with
+//! The page chrome (head + top bar + .app-body-wrap) is chrome.begin with
 //! active="docs"; the rest of the layout/CSS is rendered below.
 
 const std = @import("std");
@@ -29,9 +29,12 @@ const docs_store = @import("docs_store.zig");
 const markdown = @import("markdown.zig");
 const edge = @import("edge.zig");
 const chat = @import("chat.zig");
+const chrome = @import("chrome.zig");
+const html = @import("html.zig");
 const chat_state = @import("chat_state.zig");
 const timefmt = @import("timefmt.zig");
 const feed = @import("recent_feed.zig");
+const reading_list = @import("reading_list.zig");
 const Bus = @import("bus.zig").Bus;
 
 const Alloc = std.mem.Allocator;
@@ -46,6 +49,12 @@ const max_doc_bytes = 1 << 20;
 /// after /docs/), so a nested slash is a 404.
 pub fn handle(req: *Request, io: Io, alloc: Alloc, bus: *Bus, uid: []const u8, rest: []const u8) !void {
     if (rest.len == 0 or std.mem.eql(u8, rest, "/")) {
+        // Land straight in the doc you last touched (incl. the reading list right
+        // after a save) rather than an empty nudge. Only the bare landing falls
+        // back to the picker, and only when you have no docs at all.
+        if (try docs_store.mostRecentDocSlug(io, alloc, uid)) |slug| {
+            return http.redirect(req, try std.fmt.allocPrint(alloc, "/chat/docs/{s}", .{slug}));
+        }
         return renderDocsEditor(req, io, alloc, uid, "");
     }
     const seg = rest[1..]; // rest starts with '/'
@@ -54,6 +63,7 @@ pub fn handle(req: *Request, io: Io, alloc: Alloc, bus: *Bus, uid: []const u8, r
     if (std.mem.eql(u8, seg, "save")) return docsSave(req, io, alloc, bus, uid);
     if (std.mem.eql(u8, seg, "render")) return docsRender(req, alloc);
     if (std.mem.eql(u8, seg, "post")) return docsPost(req, io, alloc, bus, uid);
+    if (std.mem.eql(u8, seg, "save_to_reading_list")) return docsSaveToReadingList(req, io, alloc, bus, uid);
 
     if (std.mem.indexOfScalar(u8, seg, '/') != null) return http.notFound(req);
     if (std.mem.endsWith(u8, seg, ".md")) {
@@ -86,7 +96,7 @@ fn renderDocsPage(req: *Request, io: Io, alloc: Alloc, uid: []const u8, list: []
     const viewer = try users.getUserName(io, alloc, uid);
 
     var b: std.ArrayList(u8) = .empty;
-    try chat.writeChrome(&b, alloc, "Docs", "Docs", viewer, "docs");
+    try chrome.begin(&b, alloc, "Docs", "Docs", viewer, "docs");
     try b.appendSlice(alloc, docs_css);
 
     // Cross-session new-message strip + favicon alert, shared with chat via
@@ -106,7 +116,7 @@ fn renderDocsPage(req: *Request, io: Io, alloc: Alloc, uid: []const u8, list: []
         for (list) |d| {
             const active = if (std.mem.eql(u8, d.slug, slug)) " active" else "";
             try b.print(alloc, "<li class=\"docs-item{s}\"><a href=\"/chat/docs/{s}\">{s}</a></li>", .{
-                active, d.slug, try chat.htmlEscape(alloc, d.title),
+                active, d.slug, try html.htmlEscape(alloc, d.title),
             });
         }
         try b.appendSlice(alloc, "</ul>");
@@ -125,9 +135,9 @@ fn renderDocsPage(req: *Request, io: Io, alloc: Alloc, uid: []const u8, list: []
         const title = try docs_store.titleFromSlug(alloc, slug);
         try b.print(alloc, "<div class=\"docs-title-row\"><span class=\"docs-title\">{s}</span>" ++
             "<button type=\"button\" id=\"docs-post-btn\" class=\"docs-post-btn\">Post to chat</button>" ++
-            "<span class=\"docs-status\" id=\"docs-status\"></span></div>", .{try chat.htmlEscape(alloc, title)});
+            "<span class=\"docs-status\" id=\"docs-status\"></span></div>", .{try html.htmlEscape(alloc, title)});
         try b.print(alloc, "<textarea id=\"docs-body\" data-slug=\"{s}\" spellcheck=\"true\">{s}</textarea>", .{
-            try chat.htmlEscape(alloc, slug), try chat.htmlEscape(alloc, body),
+            try html.htmlEscape(alloc, slug), try html.htmlEscape(alloc, body),
         });
     }
     try b.appendSlice(alloc, "</section>");
@@ -144,12 +154,12 @@ fn renderDocsPage(req: *Request, io: Io, alloc: Alloc, uid: []const u8, list: []
     if (slug.len != 0) {
         try b.appendSlice(alloc, "<dialog id=\"docs-posted-dialog\" class=\"docs-alert-dialog\">" ++
             "<p>Doc sent to chat.</p><button type=\"button\" id=\"docs-posted-ok\">OK</button></dialog>");
-        try b.print(alloc, "<script src=\"/chat/docs.js?v={s}\"></script>", .{chat.asset_v});
+        try b.print(alloc, "<script src=\"/chat/docs.js?v={s}\"></script>", .{chrome.asset_v});
     }
     // notify.js loads even on the docs landing (the favicon alert + #chat-notify
     // strip should work here too).
-    try b.print(alloc, "<script src=\"/chat/notify.js?v={s}\"></script>", .{chat.asset_v});
-    try b.appendSlice(alloc, "</div></body></html>"); // close .app-body-wrap (PageFooter)
+    try b.print(alloc, "<script src=\"/chat/notify.js?v={s}\"></script>", .{chrome.asset_v});
+    try chrome.end(&b, alloc);
 
     try req.respond(b.items, .{ .extra_headers = &.{http.html_ct} });
 }
@@ -224,7 +234,8 @@ fn publishDocRecent(io: Io, alloc: Alloc, bus: *Bus, uid: []const u8, slug: []co
     const at = timefmt.formatRFC3339UTC(alloc, nowUnix(io)) catch return;
     const title = docs_store.titleFromSlug(alloc, slug) catch return;
     var j: std.ArrayList(u8) = .empty;
-    feed.encodeDocEvent(&j, alloc, at, slug, title) catch return;
+    // who is always "You": docs are per-user, only the author sees this row.
+    feed.encodeDocEvent(&j, alloc, at, "You", slug, title) catch return;
     const key = store.recentBusKey(alloc, uid) catch return;
     bus.publish(key, j.items);
 }
@@ -238,9 +249,9 @@ fn docsRender(req: *Request, alloc: Alloc) !void {
     // The live-preview fuzz path. markdown.render returns the visible
     // malformed_html placeholder for hostile input (the existing observable);
     // count it too so /version reflects preview probing, not just POST rejects.
-    if (markdown.hostileReason(md) != null) edge.count(.malformed_markdown);
-    const html = try markdown.render(alloc, md);
-    try req.respond(html, .{ .extra_headers = &.{http.html_ct} });
+    if (markdown.hostileReason(alloc, md) != null) edge.count(.malformed_markdown);
+    const rendered = try markdown.render(alloc, md);
+    try req.respond(rendered, .{ .extra_headers = &.{http.html_ct} });
 }
 
 /// docsPost appends the doc's current body as a chat message to the caller's
@@ -258,7 +269,7 @@ fn docsPost(req: *Request, io: Io, alloc: Alloc, bus: *Bus, uid: []const u8) !vo
         return req.respond("doc is empty\n", .{ .status = .bad_request });
     }
     // Don't broadcast hostile / over-formatted markdown to a chat partner.
-    if (markdown.hostileReason(doc_body)) |_| {
+    if (markdown.hostileReason(alloc, doc_body)) |_| {
         return edge.reject(req, .malformed_markdown, "not posted: too much markdown formatting; break the doc up\n");
     }
 
@@ -282,6 +293,32 @@ fn docsPost(req: *Request, io: Io, alloc: Alloc, bus: *Bus, uid: []const u8) !vo
         std.json.fmt(conv, .{}), std.json.fmt(sid, .{}), std.json.fmt(msg.id, .{}),
     });
     try req.respond(out, .{ .extra_headers = &.{http.json_ct} });
+}
+
+/// docsSaveToReadingList appends one saved chat message to the caller's
+/// reading-list doc (creating it on first save) → 204. The client sends the
+/// snapshot as-seen (body markdown, author, display date) plus the conv/sid/id
+/// locating the source message, plus the annotation. Acts only on the
+/// authenticated principal's own doc — uid is the session principal, never the
+/// request. reading_list.save caps the doc size (DocTooLarge → 500 here; a
+/// hammering client hits the bound, not unbounded growth).
+fn docsSaveToReadingList(req: *Request, io: Io, alloc: Alloc, bus: *Bus, uid: []const u8) !void {
+    if (req.head.method != .POST) return http.methodNotAllowed(req);
+    const body = (try http.readLimitedBody(req, alloc, max_doc_bytes)) orelse return;
+    const conv = std.mem.trim(u8, (try chat.formField(alloc, body, "conv")) orelse "", " \t\r\n");
+    const sid = std.mem.trim(u8, (try chat.formField(alloc, body, "sid")) orelse "", " \t\r\n");
+    const id = std.mem.trim(u8, (try chat.formField(alloc, body, "id")) orelse "", " \t\r\n");
+    const from = (try chat.formField(alloc, body, "from")) orelse "";
+    const at = (try chat.formField(alloc, body, "at")) orelse "";
+    const msg_body = (try chat.formField(alloc, body, "body")) orelse "";
+    const note = (try chat.formField(alloc, body, "note")) orelse "";
+    if (conv.len == 0 or sid.len == 0 or id.len == 0 or msg_body.len == 0) {
+        return req.respond("missing field\n", .{ .status = .bad_request });
+    }
+    reading_list.save(io, alloc, uid, conv, sid, id, from, at, msg_body, note) catch
+        return req.respond("save failed\n", .{ .status = .internal_server_error });
+    publishDocRecent(io, alloc, bus, uid, reading_list.reading_list_slug);
+    return req.respond("", .{ .status = .no_content });
 }
 
 // ── post-to-chat helpers ───────

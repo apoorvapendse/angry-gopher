@@ -1,7 +1,10 @@
 //! puzzles: serves /puzzles — the Lyn Rummy puzzle surface.
-//! Three routes:
+//! Routes:
 //!   GET  /puzzles                                   the page (catalog baked in)
 //!   GET  /puzzles/puzzle.js                          the Elm bundle
+//!   GET  /puzzles/engine.js | engine_glue.js         the shared TS engine + glue
+//!   GET  /puzzles/solver.wasm                         the zig board-bridge solver
+//!                                                    (powers the Hint button)
 //!   POST /puzzles/sessions/<id>/puzzles/<idx>/actions  append one action line
 //!
 //! Phase 3 (now): the whole surface is gated JUST_NEEDS_NAME — every request
@@ -17,10 +20,21 @@ const users = @import("users.zig");
 
 const puzzle_js = @embedFile("puzzle_js");
 
+// The shared Lyn Rummy engine bundle + Elm↔engine glue (same bytes /game
+// serves). Puzzles load these to power the Hint button. Wired in build.zig.
+const engine_js = @embedFile("engine_js");
+const engine_glue_js = @embedFile("engine_glue_js");
+
+// The zig board-bridge solver (ops/build_lynrummy_wasm). The glue fetches
+// it lazily on the first puzzle Hint click: arrangement line in, human
+// move plan out (ABI in games/lynrummy/zig/wasm.zig).
+const solver_wasm = @embedFile("solver_wasm");
+
 // maxAppendBytes caps a single action line.
 const maxAppendBytes = 64 * 1024;
 
-// The curated catalogs, easiest-first (1-line … 6-line). Wired in build.zig.
+// The curated catalogs, easiest-first (1-line … 6-line), then the
+// sim-mined stretch boards. Wired in build.zig.
 const catalogs = [_][]const u8{
     @embedFile("puzzle_cat_1"),
     @embedFile("puzzle_cat_2"),
@@ -28,6 +42,7 @@ const catalogs = [_][]const u8{
     @embedFile("puzzle_cat_4"),
     @embedFile("puzzle_cat_5"),
     @embedFile("puzzle_cat_6"),
+    @embedFile("puzzle_cat_sim"),
 };
 
 const Alloc = std.mem.Allocator;
@@ -49,6 +64,12 @@ pub fn handle(req: *std.http.Server.Request, io: std.Io, alloc: Alloc, sub: []co
         try page(req, io, alloc, user_id);
     } else if (std.mem.eql(u8, sub, "/puzzle.js")) {
         try req.respond(puzzle_js, .{ .extra_headers = &.{http.js_ct} });
+    } else if (std.mem.eql(u8, sub, "/engine.js")) {
+        try req.respond(engine_js, .{ .extra_headers = &.{http.js_ct} });
+    } else if (std.mem.eql(u8, sub, "/engine_glue.js")) {
+        try req.respond(engine_glue_js, .{ .extra_headers = &.{http.js_ct} });
+    } else if (std.mem.eql(u8, sub, "/solver.wasm")) {
+        try req.respond(solver_wasm, .{ .extra_headers = &.{http.wasm_ct} });
     } else if (std.mem.startsWith(u8, sub, "/sessions/")) {
         try sessionRoute(req, io, alloc, user_id, sub["/sessions/".len..]);
     } else {
@@ -168,13 +189,18 @@ const page_pre =
     \\</style>
     \\</head><body>
     \\<div id="root"></div>
+    \\<script src="/puzzles/engine.js"></script>
     \\<script src="/puzzles/puzzle.js"></script>
+    \\<script src="/puzzles/engine_glue.js"></script>
     \\<script>
     \\  var app = Elm.Puzzle.init({ node: document.getElementById("root"), flags:
 ;
 
 const page_post =
     \\ });
+    \\  // Wire the Hint button to the shared engine bundle (engine.js →
+    \\  // LynRummyEngine global) via the glue shim.
+    \\  EngineGlue.attach(app);
     \\  // Pointer transport: pointerdown captures the pointer; move/up are
     \\  // forwarded to Elm. Capture set synchronously (no Elm round-trip) so
     \\  // fast taps aren't missed; only the active pointer is forwarded.

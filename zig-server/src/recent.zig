@@ -19,7 +19,9 @@ const http = @import("http.zig");
 const users = @import("users.zig");
 const store = @import("chat_store.zig");
 const docs_store = @import("docs_store.zig");
-const chat = @import("chat.zig");
+const chat_sse = @import("chat_sse.zig");
+const chrome = @import("chrome.zig");
+const html = @import("html.zig");
 const timefmt = @import("timefmt.zig");
 const feed = @import("recent_feed.zig");
 const Bus = @import("bus.zig").Bus;
@@ -36,12 +38,15 @@ const RecentItem = struct {
     kind: Kind,
     at_ns: i96,
     at: []const u8,
+    // who: author display name, already "You" for the viewer (chat + doc).
+    who: []const u8 = "",
     // chat-only
     url: []const u8 = "",
     where: []const u8 = "",
     topic: []const u8 = "",
-    last_author: []const u8 = "",
     excerpt: []const u8 = "",
+    dm: bool = false, // 1:1 conv (vs channel) — drives the "(DM)" label
+
     // doc-only
     slug: []const u8 = "",
     title: []const u8 = "",
@@ -55,7 +60,7 @@ pub fn handle(req: *Request, io: Io, alloc: Alloc, bus: *Bus, uid: []const u8, r
     // the backlog, so the stream is live-only (no replay). Fed by the
     // appendMessage cross-page fanout + docs save/create.
     if (std.mem.eql(u8, rest, "/stream")) {
-        return chat.forwardUserStream(req, alloc, bus, try store.recentBusKey(alloc, uid));
+        return chat_sse.forwardUserStream(req, alloc, bus, try store.recentBusKey(alloc, uid));
     }
     return http.notFound(req);
 }
@@ -65,7 +70,7 @@ fn renderRecentPage(req: *Request, io: Io, alloc: Alloc, uid: []const u8) !void 
     const items = try gatherRecentItems(io, alloc, uid);
 
     var b: std.ArrayList(u8) = .empty;
-    try chat.writeChrome(&b, alloc, "Recent", "Recent", viewer, "recent");
+    try chrome.begin(&b, alloc, "Recent", "Recent", viewer, "recent");
     // Cross-page attention strip + favicon alert on incoming pings (notify.js
     // no-ops when #chat-notify is absent). Recent users camp here, so the tab
     // needs to alert too.
@@ -73,8 +78,8 @@ fn renderRecentPage(req: *Request, io: Io, alloc: Alloc, uid: []const u8) !void 
     try b.appendSlice(alloc, "<div id=\"recent-mount\"></div>");
     try emitRecentData(&b, alloc, items);
     try b.print(alloc, "<script src=\"/chat/recent.js?v={s}\"></script>" ++
-        "<script src=\"/chat/notify.js?v={s}\"></script>", .{ chat.asset_v, chat.asset_v });
-    try b.appendSlice(alloc, "</div></body></html>"); // close .app-body-wrap (PageFooter)
+        "<script src=\"/chat/notify.js?v={s}\"></script>", .{ chrome.asset_v, chrome.asset_v });
+    try chrome.end(&b, alloc);
 
     try req.respond(b.items, .{ .extra_headers = &.{http.html_ct} });
 }
@@ -89,7 +94,7 @@ fn emitRecentData(b: *std.ArrayList(u8), alloc: Alloc, items: []RecentItem) !voi
         try encodeEvent(&j, alloc, it);
     }
     try j.append(alloc, ']');
-    const safe = try replaceSeq(alloc, j.items, "</", "<\\/");
+    const safe = try html.scriptSafe(alloc, j.items);
     try b.appendSlice(alloc, "<script id=\"recent-data\" type=\"application/json\">");
     try b.appendSlice(alloc, safe);
     try b.appendSlice(alloc, "</script>");
@@ -99,8 +104,8 @@ fn emitRecentData(b: *std.ArrayList(u8), alloc: Alloc, items: []RecentItem) !voi
 /// recent_feed encoder so the backlog and the live fanout emit one shape.
 fn encodeEvent(j: *std.ArrayList(u8), alloc: Alloc, it: RecentItem) !void {
     switch (it.kind) {
-        .chat => try feed.encodeChatEvent(j, alloc, it.at, it.url, it.topic, it.where, it.last_author, it.excerpt),
-        .doc => try feed.encodeDocEvent(j, alloc, it.at, it.slug, it.title),
+        .chat => try feed.encodeChatEvent(j, alloc, it.at, it.url, it.who, it.where, it.topic, it.excerpt, it.dm),
+        .doc => try feed.encodeDocEvent(j, alloc, it.at, it.who, it.slug, it.title),
     }
 }
 
@@ -118,8 +123,8 @@ fn gatherRecentItems(io: Io, alloc: Alloc, uid: []const u8) ![]RecentItem {
         const conv = try store.chatPairKey(alloc, uid, u.id);
         const dir = try store.dmConvDir(alloc, conv);
         const base = try std.fmt.allocPrint(alloc, "/chat/c/{s}", .{conv});
-        const where = try std.fmt.allocPrint(alloc, "with {s}", .{u.name});
-        try gatherConvSessions(io, alloc, &items, dir, base, where);
+        const where = try std.fmt.allocPrint(alloc, "to {s}", .{u.name});
+        try gatherConvSessions(io, alloc, &items, dir, base, where, uid, true);
     }
 
     // Channels the viewer is a member of.
@@ -127,7 +132,7 @@ fn gatherRecentItems(io: Io, alloc: Alloc, uid: []const u8) ![]RecentItem {
         const dir = try store.channelConvDir(alloc, name);
         const base = try std.fmt.allocPrint(alloc, "/channel/{s}", .{name});
         const where = try std.fmt.allocPrint(alloc, "in {s}", .{name});
-        try gatherConvSessions(io, alloc, &items, dir, base, where);
+        try gatherConvSessions(io, alloc, &items, dir, base, where, uid, false);
     }
 
     // The viewer's own docs.
@@ -138,6 +143,7 @@ fn gatherRecentItems(io: Io, alloc: Alloc, uid: []const u8) ![]RecentItem {
             .kind = .doc,
             .at_ns = st.mtime.nanoseconds,
             .at = try timefmt.formatRFC3339UTC(alloc, secsOf(st.mtime.nanoseconds)),
+            .who = "You",
             .slug = d.slug,
             .title = d.title,
         });
@@ -149,10 +155,11 @@ fn gatherRecentItems(io: Io, alloc: Alloc, uid: []const u8) ![]RecentItem {
 }
 
 /// gatherConvSessions appends a chat row for each session in one conv: stat its
-/// mtime, resolve the last author's name from the .lastauthor companion, and
-/// build a one-line excerpt of the latest message. `base`/`where` are the conv's
-/// pre-resolved URL base and per-viewer context label.
-fn gatherConvSessions(io: Io, alloc: Alloc, items: *std.ArrayList(RecentItem), dir: []const u8, base: []const u8, where: []const u8) !void {
+/// mtime, resolve the last author ("You" for the viewer) from the .lastauthor
+/// companion, and build a one-line excerpt of the latest message. `base`/`where`
+/// are the conv's pre-resolved URL base and per-viewer context label; `dm` flags
+/// a 1:1 conv (vs a channel) for the wire.
+fn gatherConvSessions(io: Io, alloc: Alloc, items: *std.ArrayList(RecentItem), dir: []const u8, base: []const u8, where: []const u8, viewer: []const u8, dm: bool) !void {
     for (try store.listSessions(io, alloc, dir)) |sid| {
         const path = try store.sessionMdPath(alloc, dir, sid);
         const st = Io.Dir.cwd().statFile(io, path, .{}) catch continue;
@@ -160,11 +167,12 @@ fn gatherConvSessions(io: Io, alloc: Alloc, items: *std.ArrayList(RecentItem), d
             .kind = .chat,
             .at_ns = st.mtime.nanoseconds,
             .at = try timefmt.formatRFC3339UTC(alloc, secsOf(st.mtime.nanoseconds)),
+            .who = try lastAuthorName(io, alloc, dir, sid, viewer),
             .url = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ base, sid }),
             .where = where,
             .topic = sid,
-            .last_author = try lastAuthorName(io, alloc, dir, sid),
             .excerpt = try feed.recentExcerpt(alloc, try lastMessageMarkdown(io, alloc, dir, sid)),
+            .dm = dm,
         });
     }
 }
@@ -177,15 +185,17 @@ fn newestFirst(_: void, a: RecentItem, b: RecentItem) bool {
     return a.at_ns > b.at_ns;
 }
 
-/// lastAuthorName resolves the most-recent author's display name for a session:
-/// read the `<sid>.lastauthor` companion uid, map to a name. "" when the
-/// companion is missing (pre-companion sessions → recent.js's "New message").
-fn lastAuthorName(io: Io, alloc: Alloc, dir: []const u8, sid: []const u8) ![]const u8 {
+/// lastAuthorName resolves the most-recent author's display name for a session,
+/// rendered "You" when the author is the viewer: read the `<sid>.lastauthor`
+/// companion uid, map to a name. "" when the companion is missing (legacy
+/// pre-companion sessions → an empty Who cell).
+fn lastAuthorName(io: Io, alloc: Alloc, dir: []const u8, sid: []const u8, viewer: []const u8) ![]const u8 {
     const file = try std.fmt.allocPrint(alloc, "{s}.lastauthor", .{sid});
     const path = try std.fs.path.join(alloc, &.{ dir, "sessions", file });
     const raw = Io.Dir.cwd().readFileAlloc(io, path, alloc, .unlimited) catch return "";
     const auid = std.mem.trim(u8, raw, " \t\r\n");
     if (auid.len == 0) return "";
+    if (std.mem.eql(u8, auid, viewer)) return "You";
     return users.getUserName(io, alloc, auid);
 }
 
@@ -199,10 +209,3 @@ fn lastMessageMarkdown(io: Io, alloc: Alloc, dir: []const u8, sid: []const u8) !
     return msgs[msgs.len - 1].markdown;
 }
 
-/// replaceSeq returns `input` with every `needle` replaced by `repl` (alloc-owned).
-fn replaceSeq(alloc: Alloc, input: []const u8, needle: []const u8, repl: []const u8) ![]u8 {
-    const n = std.mem.replacementSize(u8, input, needle, repl);
-    const out = try alloc.alloc(u8, n);
-    _ = std.mem.replace(u8, input, needle, repl, out);
-    return out;
-}

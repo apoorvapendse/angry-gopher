@@ -1548,64 +1548,6 @@ scenario drag_invariant_board_drag_initial_floater
     initial_floater_at: (100, 200)
 """
       )
-    , ( "elm_find_play_corpus.dsl"
-      , """# elm_find_play_corpus — Elm puzzles wrapper integration scenarios.
-#
-# Each scenario gives a board + hand and pins the primitive sequence
-# returned by `elm_api/elm_find_play.ts:elmFindPlay`. The runner
-# treats the DSL as the assertion surface — both inputs and the
-# expected output stay as DSL strings on either side of the wrapper.
-#
-# Compared to physical_plan_corpus, scenarios here drop the explicit
-# `plan:` block: the wrapper IS the planner. The output covers the
-# full findPlayPrimitives pipeline (logical search → physical
-# lowering).
-
-scenario seed_extend_partial_run
-  desc: 5♥ from hand free-pulls onto partial [3♥ 4♥]; one merge_hand primitive.
-  board:
-    at (100,100): 3♥ 4♥
-    at (100,200): Q♣ Q♦ Q♥
-  hand: 5♥
-  expect:
-    primitives:
-      - merge_hand 5♥ -> [3♥ 4♥] at (100,100) /right
-scenario triple_in_hand_clean_board
-  desc: hand contains a complete set [5♠ 5♦ 5♣]; board is all helpers (clean). The triple-in-hand short-circuit fires — no BFS plan, just lay the three cards down at a fresh open loc as a seed chain.
-  board:
-    at (100,100): K♠ A♠ 2♠ 3♠
-    at (100,200): T♦ J♦ Q♦ K♦
-  hand: 5♠ 5♦ 5♣
-  expect:
-    primitives:
-      - place_hand 5♠ -> (52,272)
-      - merge_hand 5♦ -> [5♠] at (52,272) /right
-      - merge_hand 5♣ -> [5♠ 5♦] at (52,272) /right
-scenario pair_from_hand_then_peel
-  desc: pair [J♦' Q♦'] placed at fresh loc (multi-placement seed), then BFS plan peels T♦ off the helper run [T♦ J♦ Q♦ K♦] and merges it left onto the hand-laid pair to form the complete run [T♦ J♦' Q♦'].
-  board:
-    at (100,100): T♦ J♦ Q♦ K♦
-    at (100,200): K♠ A♠ 2♠ 3♠
-  hand: J♦' Q♦'
-  expect:
-    primitives:
-      - place_hand J♦' -> (52,272)
-      - merge_hand Q♦' -> [J♦'] at (52,272) /right
-      - isolate ( T♦ ) J♦ Q♦ K♦ at (100,100)
-      - merge_stack [T♦] at (100,100) -> [J♦' Q♦'] at (52,272) /left :: path (100,100@0)(100,100@25)(99,102@49)(98,105@74)(95,111@99)(91,120@123)(85,131@148)(79,145@173)(72,160@197)(64,177@222)(57,193@247)(49,210@271)(42,225@296)(36,239@321)(30,250@345)(26,259@370)(23,265@395)(22,268@419)(21,270@444)(21,270@469)
-scenario single_card_two_verb_plan
-  desc: 4♠ from hand; the augmented board has two troubles ([J♦' Q♦'] partial + the new 4♠ singleton). BFS finds a 2-move plan — peel T♦ onto [J♦' Q♦'] completes it, then push 4♠ onto [K♠ A♠ 2♠ 3♠] as a merge_hand, consuming the hand card directly.
-  board:
-    at (100,100): K♠ A♠ 2♠ 3♠
-    at (100,200): T♦ J♦ Q♦ K♦
-    at (100,300): J♦' Q♦'
-  hand: 4♠
-  expect:
-    primitives:
-      - isolate ( T♦ ) J♦ Q♦ K♦ at (100,200)
-      - merge_stack [T♦] at (100,200) -> [J♦' Q♦'] at (100,300) /left :: path (100,200@0)(100,200@14)(100,201@27)(99,203@41)(98,206@54)(96,212@68)(94,218@81)(92,226@95)(89,235@108)(86,244@122)(83,254@135)(80,263@149)(77,272@162)(75,280@176)(73,286@189)(71,292@203)(70,295@216)(69,297@230)(69,298@243)(69,298@257)
-      - merge_hand 4♠ -> [K♠ A♠ 2♠ 3♠] at (100,100) /right"""
-      )
     , ( "gesture.dsl"
       , """# Layout note: board/target blocks use `at (top, left): cards`
 # (top first, left second). The `floater_at:` and `cursor:` scalars
@@ -1754,6 +1696,275 @@ scenario gesture_floater_over_wing_way_off
     has_wing: false
 """
       )
+    , ( "hint_compress.dsl"
+      , """# hint_compress — DSL-to-DSL pins for compressHint.
+#
+# Each scenario is a raw hint (the naive one-line-per-plan-step form the
+# engine emits today) under `input:`, and the gesture-faithful rewrite
+# under `compressed:`. The runner feeds `input` through compressHint and
+# asserts string-equality on `compressed`. The DSL IS the contract; no
+# parse-back, no struct comparison.
+#
+# The rule: a hand card placed and then immediately dropped onto/into a
+# board stack is ONE drag, so `place [X] from hand` + a consuming move
+# (push / pull / splice of exactly X) fuse into one `play X from hand
+# <onto|into> <target>` line. push/pull land ONTO an existing group;
+# splice lands INTO a run. Scenarios whose `compressed` equals `input`
+# pin the boundary — the cases the rule must leave alone.
+
+# ---- fuses: the pure single-push play ----
+
+scenario push_run_end
+  desc: 4♠ extends the end of the spade run — one gesture
+  input:
+    - place [4♠] from hand
+    - push [4♠] onto HELPER [K♠ A♠ 2♠ 3♠] → [K♠ A♠ 2♠ 3♠ 4♠]
+  compressed:
+    - play 4♠ from hand onto K♠ A♠ 2♠ 3♠
+
+scenario push_run_front
+  desc: Q♠ extends the front of the spade run
+  input:
+    - place [Q♠] from hand
+    - push [Q♠] onto HELPER [K♠ A♠ 2♠ 3♠] → [Q♠ K♠ A♠ 2♠ 3♠]
+  compressed:
+    - play Q♠ from hand onto K♠ A♠ 2♠ 3♠
+
+scenario push_set_fourth
+  desc: 7♥ completes the sevens set — set extension is a push too
+  input:
+    - place [7♥] from hand
+    - push [7♥] onto HELPER [7♠ 7♦ 7♣] → [7♠ 7♦ 7♣ 7♥]
+  compressed:
+    - play 7♥ from hand onto 7♠ 7♦ 7♣
+
+scenario push_deck_two_card
+  desc: deck-2 apostrophe is dropped for the player — A♠' reads as A♠ (decks are identical to the eye; deck still matters for the identity match)
+  input:
+    - place [A♠'] from hand
+    - push [A♠'] onto HELPER [A♣ A♦ A♥] → [A♣ A♦ A♥ A♠']
+  compressed:
+    - play A♠ from hand onto A♣ A♦ A♥
+
+scenario push_target_has_deck_two
+  desc: deck-2 markers are dropped from the target cards too, not only the played card
+  input:
+    - place [9♠'] from hand
+    - push [9♠'] onto HELPER [9♦' 9♥ 9♣] → [9♦' 9♥ 9♣ 9♠']
+  compressed:
+    - play 9♠ from hand onto 9♦ 9♥ 9♣
+
+# ---- fuses: splice (lands INTO a run, which splits around the card) ----
+
+scenario splice_into_long_run
+  desc: 4♣' splices into the long rb run — keep the verb "splice" (players know it); don't spell out that the run divides into two
+  input:
+    - place [4♣'] from hand
+    - splice [4♣'] into HELPER [2♣ 3♦ 4♣ 5♥ 6♠ 7♥] → [2♣ 3♦ 4♣'] + [4♣ 5♥ 6♠ 7♥]
+  compressed:
+    - splice 4♣ from hand into 2♣ 3♦ 4♣ 5♥ 6♠ 7♥
+
+# ---- fuses: free_pull (loose card onto a partial — same gesture as push) ----
+
+scenario free_pull_onto_partial
+  desc: 8♠' completes the partial [6♠' 7♠'] — free_pull reads ONTO, like push; the "partial vs helper" distinction is invisible to the player
+  input:
+    - place [8♠'] from hand
+    - pull 8♠' onto [6♠' 7♠'] → [6♠' 7♠' 8♠'] [→COMPLETE]
+  compressed:
+    - play 8♠ from hand onto 6♠ 7♠
+
+scenario board_only_pair_push
+  desc: a pure board plan pushing a whole PAIR onto a run (the wholesale-merge pre-pass emits these) - multi-card loose group humanizes like the single-card push
+  input:
+    - push [8♠' 9♦'] onto HELPER [3♦ 4♣ 5♥ 6♠ 7♥] → [3♦ 4♣ 5♥ 6♠ 7♥ 8♠' 9♦']
+  compressed:
+    - push 8♠ 9♦ onto 3♦ 4♣ 5♥ 6♠ 7♥
+
+scenario board_only_pull_completes
+  desc: a pure board plan pulling a loose card onto a trouble pair (the pre-pass's trouble+trouble phase emits these) - COMPLETE tail stripped, deck-blind
+  input:
+    - pull 2♠ onto [K♠ A♦] → [K♠ A♦ 2♠] [→COMPLETE]
+  compressed:
+    - pull 2♠ onto K♠ A♦
+
+# ---- humanizes: standalone extract_absorb board→board moves (1 → 1) ----
+# The verb encodes the source-remnant fate (which the player watches); the
+# motion is always "move this card from source onto target". Keep the
+# recognizable verb, strip HELPER/brackets/→result/COMPLETE/spawn, deck-blind.
+
+scenario peel_end_card
+  desc: peel — take an end card off a run onto a partial
+  input:
+    - peel K♦ from HELPER [T♦ J♦ Q♦ K♦], absorb onto [J♦' Q♦'] → [J♦' Q♦' K♦] [→COMPLETE]
+  compressed:
+    - peel K♦ from T♦ J♦ Q♦ K♦ onto J♦ Q♦
+
+scenario pluck_from_long_run
+  desc: pluck — same motion, longer source run
+  input:
+    - pluck 7♥' from HELPER [4♥' 5♥' 6♥' 7♥' 8♥' 9♥ T♥], absorb onto [7♠ 7♣] → [7♠ 7♣ 7♥'] [→COMPLETE]
+  compressed:
+    - pluck 7♥ from 4♥ 5♥ 6♥ 7♥ 8♥ 9♥ T♥ onto 7♠ 7♣
+
+scenario yank_with_spawn
+  desc: yank — pull a card leaving a spawned remnant; spawn tail is dropped
+  input:
+    - yank 6♠ from HELPER [2♣ 3♦ 4♣ 5♥ 6♠ 7♥], absorb onto [5♠] → [5♠ 6♠] ; spawn [7♥]
+  compressed:
+    - yank 6♠ from 2♣ 3♦ 4♣ 5♥ 6♠ 7♥ onto 5♠
+
+scenario steal_from_set
+  desc: steal — take a card from a set, shattering the remnant (spawn dropped)
+  input:
+    - steal A♣ from HELPER [A♣ A♦ A♥], absorb onto [Q♣ K♦] → [Q♣ K♦ A♣] [→COMPLETE] ; spawn [A♦], [A♥]
+  compressed:
+    - steal A♣ from A♣ A♦ A♥ onto Q♣ K♦
+
+scenario split_out_reads_as_two_words
+  desc: split_out — internal name renders as the natural "split out"
+  input:
+    - split_out 8♠ from HELPER [7♥' 8♠ 9♦], absorb onto [6♠ 7♥] → [6♠ 7♥ 8♠] [→COMPLETE] ; spawn [7♥'], [9♦]
+  compressed:
+    - split out 8♠ from 7♥ 8♠ 9♦ onto 6♠ 7♥
+
+scenario set_peel_renders_as_peel
+  desc: set_peel — a peel from a set; internal name renders as plain "peel"
+  input:
+    - set_peel Q♣' from HELPER [Q♥' Q♠' Q♣'], absorb onto [T♣' J♦] → [T♣' J♦ Q♣'] [→COMPLETE] ; spawn [Q♥' Q♠']
+  compressed:
+    - peel Q♣ from Q♥ Q♠ Q♣ onto T♣ J♦
+
+# ---- reorders: board manipulation first, the hand card lands last ----
+# The projection layer lists "place [X] from hand" first and ignores order.
+# A human drops the card only when the board is ready, so board→board moves
+# float to the front (in the solver's order) and the hand landing (fused into
+# one line) comes last. These are real seed-42 dirty-board fixtures.
+
+scenario reorder_board_cleanup_then_hand
+  desc: turn_2 — an unrelated board cleanup (peel) leads; the 4♠ hand play lands last
+  input:
+    - place [4♠] from hand
+    - peel T♦ from HELPER [T♦ J♦ Q♦ K♦], absorb onto [J♦' Q♦'] → [T♦ J♦' Q♦'] [→COMPLETE]
+    - push [4♠] onto HELPER [K♠ A♠ 2♠ 3♠] → [K♠ A♠ 2♠ 3♠ 4♠]
+  compressed:
+    - peel T♦ from T♦ J♦ Q♦ K♦ onto J♦ Q♦
+    - play 4♠ from hand onto K♠ A♠ 2♠ 3♠
+
+scenario reorder_dirty_board_with_board_push
+  desc: turn_3 — two board moves first (a peel and a push of a LOOSE BOARD 4♠, not from hand), then the 4♣' hand splice lands last
+  input:
+    - place [4♣'] from hand
+    - peel K♦ from HELPER [T♦ J♦ Q♦ K♦], absorb onto [J♦' Q♦'] → [J♦' Q♦' K♦] [→COMPLETE]
+    - push [4♠] onto HELPER [K♠ A♠ 2♠ 3♠] → [K♠ A♠ 2♠ 3♠ 4♠]
+    - splice [4♣'] into HELPER [2♣ 3♦ 4♣ 5♥ 6♠ 7♥] → [2♣ 3♦ 4♣'] + [4♣ 5♥ 6♠ 7♥]
+  compressed:
+    - peel K♦ from T♦ J♦ Q♦ K♦ onto J♦ Q♦
+    - push 4♠ onto K♠ A♠ 2♠ 3♠
+    - splice 4♣ from hand into 2♣ 3♦ 4♣ 5♥ 6♠ 7♥
+
+scenario fuse_in_place_dependent_board_move
+  desc: the landing is MID-plan and the later pull's target is the landing's RESULT (the group 9♥ T♠ exists only after the 9♥ lands). Solver order is kept - the hand line fuses at its own position instead of floating last.
+  input:
+    - place [9♥] from hand
+    - pull 9♥ onto [T♠'] → [9♥ T♠']
+    - pull 8♠' onto [9♥ T♠'] → [8♠' 9♥ T♠'] [→COMPLETE]
+  compressed:
+    - play 9♥ from hand onto T♠
+    - pull 8♠ onto 9♥ T♠
+
+scenario triple_in_hand_lands_directly
+  desc: a triple played straight from hand onto a clean board — no target, no board move
+  input:
+    - place [7♦ 8♦ 9♦] from hand
+  compressed:
+    - play 7♦ 8♦ 9♦ from hand
+
+# ---- collapses: a hand card that SEEDS a new group (board cards absorb onto it) ----
+# The placed card isn't consumed by any move — it's the anchor a chain of
+# extract_absorbs builds on. "place X on board to build <final group>" says
+# it all (place, not play: you place a seed, you play a lander). Real seed-42
+# game-2 mid-turn state (uid 16), a K→A→2 rb run seeded from hand.
+
+scenario seed_new_group_from_hand
+  desc: 2♥ is dropped as a seed; A♣ then K♦ are peeled onto it to build the K♦ A♣ 2♥ rb run — the whole chain is one instruction
+  input:
+    - place [2♥'] from hand
+    - peel A♣ from HELPER [A♣ A♦ A♥ A♠'], absorb onto [2♥'] → [A♣ 2♥']
+    - peel K♦ from HELPER [T♦ J♦ Q♦ K♦], absorb onto [A♣ 2♥'] → [K♦ A♣ 2♥'] [→COMPLETE]
+  compressed:
+    - place 2♥ on board to build K♦ A♣ 2♥
+
+scenario seed_build_tolerates_side_repair
+  desc: real Stephen2 game-5 last-card plan - T♦' seeds the tens set, but the steal spawns [8♣' 9♦] and a push repairs it mid-plan. The side move doesn't block the collapse; placing the seed sets the loner flag, and the NEXT hint walks the player through the board cleanup.
+  input:
+    - place [T♦'] from hand
+    - steal T♣ from HELPER [8♣' 9♦ T♣], absorb onto [T♦'] → [T♣ T♦'] ; spawn [8♣' 9♦]
+    - push [8♣' 9♦] onto HELPER [T♠' J♦ Q♠] → [8♣' 9♦ T♠' J♦ Q♠]
+    - peel T♠ from HELPER [3♦' 4♣' 5♥' 6♣ 7♥ 8♠' 9♦' T♠], absorb onto [T♣ T♦'] → [T♣ T♦' T♠] [→COMPLETE]
+  compressed:
+    - place T♦ on board to build T♣ T♦ T♠
+
+scenario seed_build_chain_grown_by_shift
+  desc: real Stephen2 game-6 plan - 6♦ seeds a run, a SHIFT lands the 7♦' onto it (4♠ backfills the spade run so 5♦' 6♠ can give it up), then a peel completes. Any verb that lands onto the chain advances it.
+  input:
+    - place [6♦] from hand
+    - shift 4♠ to pop 7♦' [A♠ 2♠ 3♠ -> 4♠ + 5♦' 6♠]; absorb onto [6♦] → [6♦ 7♦']
+    - peel 8♦ from HELPER [8♦ 9♦' T♦ J♦ Q♦], absorb onto [6♦ 7♦'] → [6♦ 7♦' 8♦] [→COMPLETE]
+  compressed:
+    - place 6♦ on board to build 6♦ 7♦ 8♦
+
+# ---- collapses: a hand PAIR placed as the landing pad for a board loner ----
+#
+# The placed pair is never consumed by a move — instead the ONE move pulls a
+# board loner ONTO it. Three cards, one human thought: "put these two hand
+# cards with that board card". Scoped deliberately narrow (exactly two lines,
+# a two-card place, a pull whose target IS the placed pair) — real case:
+# Stephen2 game 5, a T♠ loner finished by the hand pair 8♠ 9♥.
+
+scenario pair_landing_pad_for_board_loner
+  desc: the T♠ sits alone on the board; the plan places the hand pair [8♠' 9♥] and pulls the T♠ onto it. One line - place the two hand cards with the loner.
+  input:
+    - place [8♠' 9♥] from hand
+    - pull T♠' onto [8♠' 9♥] → [8♠' 9♥ T♠'] [→COMPLETE]
+  compressed:
+    - place 8♠ and 9♥ with the T♠ on the board
+
+# ---- shift: backfill one end of a run so the other end can pop ----
+#
+# Physically two drags, but one thought; rendered as a single compound
+# line: "shift <p> into <run>, freeing the <stolen> onto <target>". The
+# run as the player sees it isn't in the raw line — it's rebuilt from
+# the shifted remnant minus p, plus the stolen card on the popped end.
+
+scenario shift_pop_front
+  desc: 3♠ backfills the end of K♠ A♠ 2♠ so the K♠ can pop off the front onto J♣ Q♦ — p enters the end, stolen leaves the front
+  input:
+    - shift 3♠ to pop K♠ [4♥ 5♣' 6♥' -> A♠ 2♠ + 3♠]; absorb onto [J♣' Q♦] → [J♣' Q♦ K♠]
+  compressed:
+    - shift 3♠ into K♠ A♠ 2♠, freeing the K♠ onto J♣ Q♦
+
+scenario shift_pop_end_after_peel
+  desc: real Stephen2 game-5 board-only plan (T♥' loner) - peel 9♥ onto the loner, then shift 5♠ into 6♦ 7♠ 8♥ to free the 8♥ that completes it. The shift blocked the WHOLE hint from humanizing before this pin.
+  input:
+    - peel 9♥ from HELPER [9♥ T♠' J♦ Q♠], absorb onto [T♥'] → [9♥ T♥']
+    - shift 5♠ to pop 8♥ [Q♣ K♥ A♠' 2♦' 3♣' 4♦ -> 5♠ + 6♦' 7♠']; absorb onto [9♥ T♥'] → [8♥ 9♥ T♥'] [→COMPLETE]
+  compressed:
+    - peel 9♥ from 9♥ T♠ J♦ Q♠ onto T♥
+    - shift 5♠ into 6♦ 7♠ 8♥, freeing the 8♥ onto 9♥ T♥
+
+# ---- bails: return the plan raw rather than half-transform it ----
+
+scenario passthrough_placed_card_never_consumed
+  desc: the placed 8♣ is never landed by any move (only a board 4♠ push) — can't reorder safely, so leave it raw
+  input:
+    - place [8♣] from hand
+    - push [4♠] onto HELPER [K♠ A♠ 2♠ 3♠] → [K♠ A♠ 2♠ 3♠ 4♠]
+  compressed:
+    - place [8♣] from hand
+    - push [4♠] onto HELPER [K♠ A♠ 2♠ 3♠] → [K♠ A♠ 2♠ 3♠ 4♠]
+"""
+      )
     , ( "hint_dirty_board.dsl"
       , """# hint_dirty_board.dsl — pin the dirty-board contract for the
 # hand-aware hint surface.
@@ -1780,6 +1991,237 @@ scenario triple_in_hand_with_dirty_board_returns_no_hint
   board:
     - 5♣ 6♣
   expect_steps:
+
+# --- loner flag: a hand-origin loner should be finished with BOARD cards
+#     first, not by projecting more hand cards. Real seed-42 game-2 mid-turn
+#     state (uid 16): the 2♠ we just laid onto an empty spot completes into a
+#     set of 2s using two board peels — no hand card needed. WITHOUT the loner
+#     flag the solver projects [8♥ 9♣] and bundles an unrelated 8-9-T run;
+#     WITH it, the hint is just the two board peels that finish the 2♠.
+
+# --- loner needs a hand PAIR: board-only fails, so the solver projects a
+#     pair and the loner is pulled onto it. Real Stephen2 game-5 state: T♠'
+#     laid onto an empty spot; no 8/9/J/Q or ten is extractable from the
+#     board without stranding cards, so no board-only finish exists. The
+#     pair [8♠' 9♥] lands and the T♠' completes it. The whole hint reads as
+#     ONE line (the pair-landing-pad compression).
+
+scenario loner_ts_completed_with_hand_pair
+  desc: T♠' was just placed from hand onto an empty spot (loner=true). Board-only fails; the solver projects the hand pair [8♠' 9♥] and pulls the T♠' onto it. Compresses to a single place-with line.
+  op: hint_for_hand
+  loner: true
+  hand: 4♥' 6♥' 9♥ 8♠' 9♠' J♠' A♦' 9♦' J♦' 3♣ 5♣ 6♣ J♣ Q♣
+  board:
+    - K♠ A♠ 2♠ 3♠
+    - T♦ J♦ Q♦ K♦
+    - 2♥ 3♥ 4♥
+    - 7♠ 7♦ 7♣
+    - A♣ A♦ A♥
+    - 2♣ 3♦ 4♣ 5♥ 6♠ 7♥
+    - T♠'
+  expect_steps:
+    - place 8♠ and 9♥ with the T♠ on the board
+
+# --- wholesale-merge pre-pass, trouble+trouble first: two trouble stacks
+#     that COMPLETE each other merge together before anything leans on a
+#     helper. Real Stephen2 game-5 state: after cannibalizing groups to
+#     build the ace set, [K♠ A♦] and [2♠] are left over — and they ARE the
+#     wrap run K♠ A♦ 2♠. Without this phase the pre-pass dragged each
+#     piece one-by-one onto the healthy [3♦ 4♣ 5♥ 6♠] run (two moves,
+#     touching structure the play never needed). Only COMPLETE results
+#     count: two loose cards never merge into a still-troublesome pair
+#     (they may have been split apart for good board-wide reasons).
+
+scenario loner_trouble_pair_and_singleton_complete_each_other
+  desc: trouble [K♠ A♦] + [2♠] snap together into the complete wrap run (loner=true). One free_pull, board clean; the healthy 3♦-6♠ run is never touched.
+  op: hint_for_hand
+  loner: true
+  hand: J♣
+  board:
+    - J♦ Q♦ K♦
+    - 2♥ 3♥ 4♥
+    - 7♠ 7♦ 7♣
+    - A♣ 2♣ 3♣
+    - 3♦ 4♣ 5♥ 6♠
+    - 6♣ 7♥ 8♠' 9♦'
+    - 9♥ T♠' J♦' Q♣
+    - 9♠' T♦ J♠'
+    - 3♠ 4♥' 5♣ 6♥'
+    - A♥ A♦' A♠
+    - K♠ A♦
+    - 2♠
+  expect_steps:
+    - pull 2♠ onto K♠ A♦
+
+# --- wholesale-merge pre-pass: a human looks for whole stacks that simply
+#     join BEFORE anything that merits the word "solve". Real Stephen2
+#     game-5 state: the trouble pair [8♠' 9♦'] extends the rb run
+#     [3♦ 4♣ 5♥ 6♠ 7♥] wholesale. The BFS solve instead returned the
+#     trouble-greedy peel (7♥ off the run onto the pair) — same plan
+#     length, but it shaves a healthy run and keeps the stack count,
+#     where the merge grows a 7-card run and drops a stack. With the
+#     loner flag set, the pre-pass finds the merge and never solves.
+
+scenario loner_pair_merges_wholesale_onto_run
+  desc: trouble pair [8♠' 9♦'] (built from a placed loner, loner=true) joins the rb run wholesale. The pre-pass hint is the single push; the solver's peel never surfaces.
+  op: hint_for_hand
+  loner: true
+  hand: A♦' 6♣ J♣
+  board:
+    - K♠ A♠ 2♠
+    - J♦ Q♦ K♦ A♦
+    - A♥ 2♥ 3♥ 4♥
+    - 7♠ 7♦ 7♣
+    - A♣ 2♣ 3♣
+    - 3♦ 4♣ 5♥ 6♠ 7♥
+    - 9♥ T♠' J♦' Q♣
+    - 9♠' T♦ J♠'
+    - 3♠ 4♥' 5♣ 6♥'
+    - 8♠' 9♦'
+  expect_steps:
+    - push 8♠ 9♦ onto 3♦ 4♣ 5♥ 6♠ 7♥
+
+# --- in-place fusion: the landing is mid-plan and a later board move
+#     consumes its RESULT. Real Stephen2 game-5 follow-on state: after the
+#     pair hint, the player moved the 8♠' to the board too — two loners
+#     (T♠', 8♠'). The solver lands 9♥ on the T♠', then pulls the 8♠' onto
+#     [9♥ T♠']. Floating that pull ahead of the landing (the old reorder)
+#     told the player to pull onto a group that didn't exist yet.
+
+scenario loner_ts_and_8s_hand_card_lands_mid_plan
+  desc: two loners T♠' and 8♠' (loner=true). Board-only fails; the solver projects 9♥, lands it on the T♠', then pulls the 8♠' onto the result. Solver order is kept - play from hand FIRST, then the dependent pull.
+  op: hint_for_hand
+  loner: true
+  hand: 4♥' 6♥' 9♥ 9♠' J♠' A♦' 9♦' J♦' 3♣ 5♣ 6♣ J♣ Q♣
+  board:
+    - K♠ A♠ 2♠ 3♠
+    - T♦ J♦ Q♦ K♦
+    - 2♥ 3♥ 4♥
+    - 7♠ 7♦ 7♣
+    - A♣ A♦ A♥
+    - 2♣ 3♦ 4♣ 5♥ 6♠ 7♥
+    - T♠'
+    - 8♠'
+  expect_steps:
+    - play 9♥ from hand onto T♠
+    - pull 8♠ onto 9♥ T♠
+
+scenario loner_2s_finished_with_board_cards
+  desc: 2♠ was just placed from hand onto an empty spot (loner=true). The board can be made fully legal by peeling 2♣ and 2♥ onto it (a set of 2s) — zero new hand cards. The hint is board-only; no "place from hand" line.
+  op: hint_for_hand
+  loner: true
+  hand: 8♥ 4♦ 8♦ 6♣' 9♣'
+  board:
+    - K♠ A♠ 2♠
+    - T♦ J♦ Q♦ K♦
+    - 2♥ 3♥ 4♥ 5♥'
+    - 7♠ 7♦ 7♣
+    - A♣ A♦ A♥ A♠'
+    - 2♣ 3♦ 4♣ 5♥ 6♠'
+    - 5♦' 6♠ 7♥
+    - T♠' J♥' Q♠
+    - 2♥' 3♠ 4♥'
+    - 2♠'
+  expect_steps:
+    - peel 2♣ from 2♣ 3♦ 4♣ 5♥ 6♠ onto 2♠
+    - peel 2♥ from 2♥ 3♥ 4♥ 5♥ onto 2♣ 2♠
+
+# --- shift humanization: a board-only plan whose second move is a shift.
+#     Real Stephen2 game-5 state: T♥' just placed as a loner (loner=true).
+#     The solve peels 9♥ onto it, then shifts 5♠ into 6♦' 7♠' 8♥ so the
+#     8♥ can pop off and complete [8♥ 9♥ T♥']. Before the shift verb was
+#     humanized, the all-or-nothing guardrail returned the ENTIRE hint in
+#     engine-speak — including the peel line we already knew how to render.
+
+scenario loner_th_peel_then_shift_frees_the_eight
+  desc: board-only two-step plan for the T♥' loner - peel 9♥ onto it, then the compound shift line (backfill 5♠, freeing the 8♥). Both lines human.
+  op: hint_for_hand
+  loner: true
+  hand: Q♥ K♣ J♥
+  board:
+    - 7♠ 7♦ 7♣
+    - 8♣' 9♦ T♣
+    - A♥ A♦' A♣
+    - T♥ J♣ Q♦
+    - K♥' K♦ K♠
+    - 4♥ 5♥ 6♥
+    - 9♥ T♠' J♦ Q♠
+    - A♣' 2♣ 3♣ 4♣
+    - Q♣ K♥ A♠' 2♦' 3♣' 4♦ 5♠
+    - J♣' J♦' J♠'
+    - Q♣' K♦' A♠ 2♥
+    - A♥' 2♠' 3♦ 4♠' 5♦' 6♠'
+    - 9♥' 9♣ 9♠
+    - 3♦' 4♣' 5♥' 6♣ 7♥ 8♠' 9♦' T♠
+    - 8♦ 9♠' T♦
+    - 6♥' 6♠ 6♣'
+    - 6♦' 7♠' 8♥
+    - A♦ 2♠ 3♥ 4♠ 5♦
+    - 2♥' 3♠ 4♥' 5♣
+    - T♥'
+  expect_steps:
+    - peel 9♥ from 9♥ T♠ J♦ Q♠ onto T♥
+    - shift 5♠ into 6♦ 7♠ 8♥, freeing the 8♥ onto 9♥ T♥
+
+# --- seed-build collapse with a side repair. Real Stephen2 game-5 state:
+#     one card left in hand (T♦'). The solve seeds the tens set with it,
+#     steals the T♣ (spawning [8♣' 9♦]), repairs the spawn onto the T♠'
+#     run, and peels the T♠ to complete [T♣ T♦' T♠]. The side repair used
+#     to block the seed collapse — the player saw four raw engine lines.
+#     One line now; placing the seed sets the loner flag, so subsequent
+#     Hint presses walk the board-only cleanup.
+
+scenario last_card_seeds_tens_set_despite_spawn_repair
+  desc: hand is just T♦' (loner=false - last action merged a hand card onto a run). Four-move plan collapses to the one seed line.
+  op: hint_for_hand
+  loner: false
+  hand: T♦'
+  board:
+    - 7♠ 7♦ 7♣
+    - 8♣' 9♦ T♣
+    - A♥ A♦' A♣
+    - T♥ J♣ Q♦
+    - K♥' K♦ K♠
+    - 4♥ 5♥ 6♥
+    - A♣' 2♣ 3♣ 4♣
+    - J♣' J♦' J♠'
+    - Q♣' K♦' A♠ 2♥
+    - A♥' 2♠' 3♦ 4♠' 5♦' 6♠'
+    - 9♥' 9♣ 9♠
+    - 3♦' 4♣' 5♥' 6♣ 7♥ 8♠' 9♦' T♠
+    - 8♦ 9♠' T♦
+    - 6♥' 6♠ 6♣'
+    - A♦ 2♠ 3♥ 4♠ 5♦
+    - 2♥' 3♠ 4♥' 5♣
+    - T♠' J♦ Q♠
+    - 8♥ 9♥ T♥'
+    - Q♣ K♥ A♠' 2♦' 3♣' 4♦ 5♠ 6♦' 7♠' 8♥'
+  expect_steps:
+    - place T♦ on board to build T♣ T♦ T♠
+
+# --- seed-build chain grown by a shift. Real Stephen2 game-6 state: the
+#     projected 6♦ seeds a diamond run; the first grower is a SHIFT (4♠
+#     backfills the spade run so [5♦' 6♠] can donate the 7♦'), then a peel
+#     completes [6♦ 7♦' 8♦]. The chain-follow treats every landing verb
+#     alike, so the shift advances the chain just as an absorb does.
+
+scenario seed_grown_by_shift_then_peel
+  desc: hand has 6♦ among others (loner=false). The three-move plan collapses to the one seed line naming the run it builds.
+  op: hint_for_hand
+  loner: false
+  hand: Q♥ 9♠ J♠ 2♦' 6♦ T♣' J♣
+  board:
+    - 2♥ 3♥ 4♥
+    - K♥' K♦ K♠
+    - 5♦' 6♠ 7♦'
+    - A♣ A♦ A♥ A♠'
+    - A♠ 2♠ 3♠ 4♠
+    - 8♦ 9♦' T♦ J♦ Q♦
+    - 7♠ 7♦ 7♣
+    - 2♣ 3♦ 4♣
+    - 5♥ 6♥' 7♥
+  expect_steps:
+    - place 6♦ on board to build 6♦ 7♦ 8♦
 """
       )
     , ( "hint_game_seed42.dsl"
@@ -1796,8 +2238,7 @@ scenario turn_1_hint
     - A♣ A♦ A♥
     - 2♣ 3♦ 4♣ 5♥ 6♠ 7♥
   expect_steps:
-    - place [4♠] from hand
-    - push [4♠] onto HELPER [K♠ A♠ 2♠ 3♠] → [K♠ A♠ 2♠ 3♠ 4♠]
+    - play 4♠ from hand onto K♠ A♠ 2♠ 3♠
 
 scenario turn_2_hint
   op: hint_for_hand
@@ -1811,9 +2252,8 @@ scenario turn_2_hint
     - 2♣ 3♦ 4♣ 5♥ 6♠ 7♥
     - J♦' Q♦'
   expect_steps:
-    - place [4♠] from hand
-    - peel T♦ from HELPER [T♦ J♦ Q♦ K♦], absorb onto [J♦' Q♦'] → [T♦ J♦' Q♦'] [→COMPLETE]
-    - push [4♠] onto HELPER [K♠ A♠ 2♠ 3♠] → [K♠ A♠ 2♠ 3♠ 4♠]
+    - peel T♦ from T♦ J♦ Q♦ K♦ onto J♦ Q♦
+    - play 4♠ from hand onto K♠ A♠ 2♠ 3♠
 
 scenario turn_3_hint
   op: hint_for_hand
@@ -1828,10 +2268,9 @@ scenario turn_3_hint
     - J♦' Q♦'
     - 4♠
   expect_steps:
-    - place [4♣'] from hand
-    - peel K♦ from HELPER [T♦ J♦ Q♦ K♦], absorb onto [J♦' Q♦'] → [J♦' Q♦' K♦] [→COMPLETE]
-    - push [4♠] onto HELPER [K♠ A♠ 2♠ 3♠] → [K♠ A♠ 2♠ 3♠ 4♠]
-    - splice [4♣'] into HELPER [2♣ 3♦ 4♣ 5♥ 6♠ 7♥] → [2♣ 3♦ 4♣'] + [4♣ 5♥ 6♠ 7♥]
+    - peel K♦ from T♦ J♦ Q♦ K♦ onto J♦ Q♦
+    - push 4♠ onto K♠ A♠ 2♠ 3♠
+    - splice 4♣ from hand into 2♣ 3♦ 4♣ 5♥ 6♠ 7♥
 """
       )
     , ( "physical_plan_corpus.dsl"
@@ -3548,7 +3987,7 @@ scenario mined_mined_008_Q♦p1
       )
     , ( "referee.dsl"
       , """# Referee conformance scenarios (validate_turn_complete only).
-# Compiled to native Go + Elm tests.
+# Compiled to native TS + Elm tests.
 
 scenario turn_complete_clean_board
   desc: Every stack on the board is a valid group (run + set, well-spaced).
@@ -7177,6 +7616,88 @@ scenario wings_for_stack_dual_deck_both_are_targets
       side: Right
     - target: 2♣' 3♦' 4♣'
       side: Right
+"""
+      )
+    , ( "zig_agent_corpus.dsl"
+      , """# zig_agent_corpus — Player Two end-to-end conformance: board + hand
+# DSL through the REAL solver.wasm (`agentStep`) and the TS lowering
+# (`zigPlanPrimitives`), pinning the primitive sequence Elm would
+# animate. This is the cross-language drift alarm: a zig recipe-format
+# change, a policy change, or a lowering change all fail here first.
+#
+# Empty `primitives:` block = the agent is stuck (wasm returned 0) —
+# the end-of-turn signal.
+#
+# The runner also asserts the applied result: after a play, EVERY
+# stack on the simulated board must be a complete meld (a zig play is
+# a full cover by construction).
+
+scenario extend_partial_run
+  desc: 5♥ from hand completes the board's partial [3♥ 4♥]; the strongest single is also the simplest — one hand-direct merge.
+  board:
+    at (100,100): 3♥ 4♥
+    at (100,200): Q♣ Q♦ Q♥
+  hand: 5♥
+  expect:
+    primitives:
+      - merge_hand 5♥ -> [3♥ 4♥] at (100,100) /right
+scenario triple_in_hand_clean_board
+  desc: no single or pair from [5♠ 5♦ 5♣] can cover, the triple can — laid down as anchor + two joiners at a fresh loc sized for the set.
+  board:
+    at (100,100): K♠ A♠ 2♠ 3♠
+    at (100,200): T♦ J♦ Q♦ K♦
+  hand: 5♠ 5♦ 5♣
+  expect:
+    primitives:
+      - place_hand 5♦ -> (52,272)
+      - merge_hand 5♠ -> [5♦] at (52,272) /right
+      - merge_hand 5♣ -> [5♦ 5♠] at (52,272) /right
+scenario pair_needs_board_surgery
+  desc: J♦' Q♦' can only land by restructuring the diamond run — no single plays (five diamonds have no cover), the pair does. T♦ peels off as a bare anchor and the hand cards build the new run on it.
+  board:
+    at (100,100): T♦ J♦ Q♦ K♦
+    at (100,200): K♠ A♠ 2♠ 3♠
+  hand: J♦' Q♦'
+  expect:
+    primitives:
+      - isolate ( T♦ ) J♦ Q♦ K♦ at (100,100)
+      - move_stack [T♦] at (100,100) -> (52,272) :: path (100,100@0)(100,100@23)(100,102@47)(99,105@70)(97,111@94)(94,120@117)(91,132@141)(87,145@164)(83,161@188)(78,178@211)(74,194@235)(69,211@258)(65,227@282)(61,240@305)(58,252@329)(55,261@352)(53,267@376)(52,270@399)(52,272@423)(52,272@446)
+      - merge_hand J♦' -> [T♦] at (52,272) /right
+      - merge_hand Q♦' -> [T♦ J♦'] at (52,272) /right
+scenario steal_from_mid_set
+  desc: 9♦ from hand needs 6♦7♦8♦9♦ — the 8♦ comes out of the middle of the four-set (isolate), the remnant pair rejoins (zig closes the gap), then the run assembles.
+  board:
+    at (100,100): 8♥ 8♠ 8♦ 8♣
+    at (100,300): 6♦ 7♦
+  hand: 9♦
+  expect:
+    primitives:
+      - isolate 8♥ 8♠ ( 8♦ ) 8♣ at (100,100)
+      - move_stack [8♥ 8♠] at (98,100) -> (52,182) :: path (98,100@0)(98,100@12)(98,101@25)(97,103@37)(95,105@49)(93,110@62)(90,115@74)(86,122@87)(82,129@99)(77,137@111)(73,145@124)(68,153@136)(64,160@148)(60,167@161)(57,172@173)(55,177@186)(53,179@198)(52,181@210)(52,182@223)(52,182@235)
+      - merge_stack [8♣] at (201,100) -> [8♥ 8♠] at (52,182) /right :: path (201,100@0)(201,100@15)(200,101@30)(199,102@45)(196,105@60)(191,109@75)(186,115@90)(180,121@105)(172,128@120)(164,136@135)(157,144@150)(149,152@165)(141,159@180)(135,165@195)(130,171@210)(125,175@225)(122,178@240)(121,179@255)(120,180@270)(120,180@285)
+      - merge_stack [8♦] at (166,100) -> [6♦ 7♦] at (100,300) /right :: path (166,100@0)(166,100@26)(166,102@52)(166,106@78)(166,113@104)(166,123@130)(166,137@156)(167,152@182)(167,170@208)(167,189@234)(167,209@261)(167,228@287)(167,246@313)(168,261@339)(168,275@365)(168,285@391)(168,292@417)(168,296@443)(168,298@469)(168,298@495)
+      - merge_hand 9♦ -> [6♦ 7♦ 8♦] at (100,300) /right
+scenario stuck_hand_yields_turn
+  desc: 9♣ on a board with no 8♣/T♣/other 9s in reach — every probe refuted, the agent draws.
+  board:
+    at (100,100): K♠ A♠ 2♠ 3♠
+    at (100,200): 7♠ 7♦ 7♣
+  hand: 9♣
+  expect:
+    primitives:
+scenario game19_lone_primed_copy
+  desc: the game-19 regression (2026-07-25) — the agent's second move plays 2♦', whose bare twin is still in the deck; the recipe must keep the prime (and A♦' on the run, whose bare twin sits in the ace set) or the lowering throws "stack not found". Board is the live state after the agent's first play.
+  board:
+    at (70,20): K♠ A♠ 2♠ 3♠
+    at (160,80): T♦ J♦ Q♦ K♦ A♦'
+    at (100,140): 2♥ 3♥ 4♥
+    at (40,200): 7♠ 7♦ 7♣
+    at (130,260): A♣ A♦ A♥
+    at (70,320): 2♣ 3♦ 4♣ 5♥ 6♠ 7♥
+  hand: 2♦' 5♦ 6♦ K♦' 4♥' 6♥' 7♥' Q♥ K♥ 4♠' T♠' 3♣ 5♣' Q♣'
+  expect:
+    primitives:
+      - merge_hand 2♦' -> [T♦ J♦ Q♦ K♦ A♦'] at (160,80) /right
 """
       )
     ]

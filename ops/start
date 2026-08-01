@@ -26,7 +26,7 @@ data_dir (all writable state) and auth_dir (the account store). Create it:
 
     mkdir -p "$(dirname "$GOPHER_CONFIG")"
     cat > "$GOPHER_CONFIG" <<'CONF'
-    data_dir = ~/AngryGopher/prod
+    data_dir = ~/AngryGopher/local
     auth_dir = ~/Auth
     CONF
 
@@ -58,7 +58,9 @@ cd "$GOPHER_DIR"
 # Build the front-end bundles FIRST: build.zig @embedFiles them into the
 # binary, so they must exist and be current before `zig build`.
 "$(dirname "$0")/build_elm"
-"$(dirname "$0")/build_driving"
+"$(dirname "$0")/build_delivery"
+"$(dirname "$0")/build_safari_wasm"
+"$(dirname "$0")/build_chess_wasm"
 
 # Build the server. set -e stops here if the build fails, so nothing relaunches.
 ( cd "$GOPHER_DIR/zig-server" && zig build )

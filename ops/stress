@@ -1,0 +1,26 @@
+#!/bin/bash
+# CANONICAL DEV-LOOP SCRIPT — DO NOT REINVENT.
+# Before composing an ad-hoc shell command for build / launch / test, run
+# `ops/list` to see what already exists.
+#
+# Leak stress hunt: spin a HERMETIC server in a /tmp sandbox on a side port and
+# hammer every endpoint, watching /debug/mem's live_bytes for sustained growth (a
+# leak) vs a one-time plateau (a cache). The real :9001 dev server and the real
+# local data are never touched, so this is safe to run any time.
+#
+# Exit 0 = all endpoints clean, 1 = a leak was detected, 2 = harness error.
+# To prove the detector itself works, see ops/stress_selftest.
+set -e
+
+source "$(dirname "$0")/_paths.sh"
+source "$(dirname "$0")/_stress_lib.sh"
+
+trap stress_sandbox_down EXIT
+stress_sandbox_up                    # normal build, no fake leak
+
+# Run the harness directly (so its exit code is ours), then let the trap tear down.
+set +e
+"$GOPHER_DIR/zig-server/zig-out/bin/stress"
+RC=$?
+set -e
+exit "$RC"

@@ -17,6 +17,8 @@ const http = @import("http.zig");
 const users = @import("users.zig");
 const storage = @import("storage.zig");
 const chat = @import("chat.zig");
+const store = @import("chat_store.zig");
+const html = @import("html.zig");
 const settings = @import("settings.zig");
 
 const Request = std.http.Server.Request;
@@ -48,7 +50,7 @@ fn handleDelete(req: *Request, io: Io, alloc: Alloc) !void {
         storage.deleteUserData(io, alloc, id) catch return req.respond("delete failed\n", .{ .status = .internal_server_error });
         return http.redirect(req, try std.fmt.allocPrint(alloc, "/admin?deleted={s}", .{id}));
     }
-    const id = std.mem.trim(u8, queryValue(req.head.target, "user") orelse "", " \t\r\n");
+    const id = std.mem.trim(u8, http.queryValue(try http.target(req, alloc), "user") orelse "", " \t\r\n");
     if (id.len == 0 or !users.principalExists(io, alloc, id)) return http.redirect(req, "/admin");
     return renderDeleteConfirm(req, io, alloc, id);
 }
@@ -100,19 +102,21 @@ fn renderOverview(req: *Request, io: Io, alloc: Alloc) !void {
     try b.appendSlice(alloc, overview_head);
 
     // Flash (delete / key-revoke confirmations), keyed by uid in the query.
-    if (queryValue(req.head.target, "deleted")) |d| {
-        const name = try chat.htmlEscape(alloc, try users.getUserName(io, alloc, d));
+    const tgt = try http.target(req, alloc);
+    if (http.queryValue(tgt, "deleted")) |d| {
+        const name = try html.htmlEscape(alloc, try users.getUserName(io, alloc, d));
         try b.print(alloc, "<p class=\"flash\">Deleted game data for <strong>{s}</strong>.</p>", .{name});
-    } else if (queryValue(req.head.target, "keyrevoked")) |k| {
-        const name = try chat.htmlEscape(alloc, try users.getUserName(io, alloc, k));
+    } else if (http.queryValue(tgt, "keyrevoked")) |k| {
+        const name = try html.htmlEscape(alloc, try users.getUserName(io, alloc, k));
         try b.print(alloc, "<p class=\"flash\">Revoked the API key for <strong>{s}</strong>.</p>", .{name});
     }
 
     try renderMembersTable(&b, io, alloc);
+    try renderNameOnlyTable(&b, io, alloc);
 
     try b.print(alloc, "<h2>Sessions per player</h2>\n<p class=\"muted\">Read straight from {s}.</p>\n<table>\n" ++
         "<tr><th>Player</th><th class=\"n\">Games</th><th class=\"n\">Puzzles</th><th class=\"n\">Actions</th><th class=\"n\">Disk</th><th></th></tr>", .{
-        try chat.htmlEscape(alloc, storage.data_root),
+        try html.htmlEscape(alloc, storage.data_root),
     });
 
     if (rows.items.len == 0) {
@@ -154,7 +158,7 @@ fn renderMembersTable(b: *std.ArrayList(u8), io: Io, alloc: Alloc) !void {
     }
     const now = nowUnix(io);
     for (rows.items) |row| {
-        var name = try chat.htmlEscape(alloc, row.name);
+        var name = try html.htmlEscape(alloc, row.name);
         if (row.is_admin) name = try std.fmt.allocPrint(alloc, "{s} <span class=\"muted\">(admin)</span>", .{name});
         if (row.is_agent) name = try std.fmt.allocPrint(alloc, "{s} <span class=\"muted\">(agent)</span>", .{name});
         const since = if (row.last_seen) |t| try humanizeSince(alloc, now - t) else "never";
@@ -177,12 +181,86 @@ fn memberLessThan(_: void, a: MemberRow, b: MemberRow) bool {
     return a.last_seen.? > b.last_seen.?; // most-recent first
 }
 
+const GuestRow = struct {
+    id: []const u8,
+    name: []const u8,
+    last_seen: ?i64,
+    games: i64,
+    moves: i64,
+    comments: i64,
+    disk_bytes: i64,
+};
+
+/// renderNameOnlyTable lists the name-only users — accounts with a name but no
+/// password (guests minted by the blog-comment / guest-login flow), excluding the
+/// agent. For each: time since last activity (last-seen is a single "last active"
+/// across every surface — a guest's only surfaces are Lyn Rummy and comments
+/// anyway), Lyn Rummy games + moves stolen from the per-player walk, and the
+/// blog-comment count (tallied by display name). This is the roster the archive
+/// tool will work from.
+fn renderNameOnlyTable(b: *std.ArrayList(u8), io: Io, alloc: Alloc) !void {
+    const tally = try store.tallyBlogComments(io, alloc);
+
+    var rows: std.ArrayList(GuestRow) = .empty;
+    for (try users.listUserIDs(io, alloc)) |id| {
+        if (users.principalAuthorized(io, alloc, id)) continue; // members + agent live above
+        const st = gatherUserStats(io, alloc, id);
+        try rows.append(alloc, .{
+            .id = id,
+            .name = st.name,
+            .last_seen = users.userLastSeen(io, alloc, id),
+            .games = st.game_sessions,
+            .moves = st.total_actions,
+            .comments = commentCount(tally, st.name),
+            .disk_bytes = st.disk_bytes,
+        });
+    }
+    std.sort.insertion(GuestRow, rows.items, {}, guestLessThan);
+
+    try b.appendSlice(alloc, name_only_table_head);
+    if (rows.items.len == 0) {
+        try b.appendSlice(alloc, "<tr><td colspan=\"6\" class=\"muted\">No name-only users.</td></tr></table>");
+        return;
+    }
+    const now = nowUnix(io);
+    for (rows.items) |row| {
+        const name = try html.htmlEscape(alloc, row.name);
+        const since = if (row.last_seen) |t| try humanizeSince(alloc, now - t) else "never";
+        try b.print(alloc, "<tr><td>{s} <span class=\"muted\">#{s}</span></td><td>{s}</td>" ++
+            "<td class=\"n\">{d}</td><td class=\"n\">{d}</td><td class=\"n\">{d}</td><td class=\"n\">{s}</td></tr>", .{
+            name,        try html.htmlEscape(alloc, row.id),
+            since,       row.games,
+            row.moves,   row.comments,
+            try humanBytes(alloc, row.disk_bytes),
+        });
+    }
+    try b.appendSlice(alloc, "</table>");
+}
+
+/// commentCount returns a name's blog-comment total from the tally (0 if none).
+fn commentCount(tally: []const store.CommentTally, name: []const u8) i64 {
+    for (tally) |t| {
+        if (std.mem.eql(u8, t.name, name)) return t.count;
+    }
+    return 0;
+}
+
+/// guestLessThan: active-ever first (most-recent first), never-active last —
+/// same ordering as the members table.
+fn guestLessThan(_: void, a: GuestRow, b: GuestRow) bool {
+    const a_ever = a.last_seen != null;
+    const b_ever = b.last_seen != null;
+    if (a_ever != b_ever) return a_ever;
+    if (!a_ever) return false;
+    return a.last_seen.? > b.last_seen.?;
+}
+
 /// appendApiKeyCell writes the API-key controls for one member: Generate (becomes
 /// Regenerate + Revoke once a key exists), all POSTing to /admin/apikey.
 fn appendApiKeyCell(b: *std.ArrayList(u8), io: Io, alloc: Alloc, id: []const u8) !void {
     const has = users.userHasAPIKey(io, alloc, id);
     const gen = if (has) "Regenerate" else "Generate";
-    const esc = try chat.htmlEscape(alloc, id);
+    const esc = try html.htmlEscape(alloc, id);
     try b.print(alloc, "<form class=\"inline\" method=\"post\" action=\"/admin/apikey\">" ++
         "<input type=\"hidden\" name=\"user\" value=\"{s}\">" ++
         "<button class=\"key\" type=\"submit\">{s}</button></form>", .{ esc, gen });
@@ -196,7 +274,7 @@ fn appendApiKeyCell(b: *std.ArrayList(u8), io: Io, alloc: Alloc, id: []const u8)
 fn writeStatsRow(b: *std.ArrayList(u8), alloc: Alloc, st: UserStats, cls: []const u8, actions_cell: []const u8) !void {
     const row_class = if (cls.len != 0) try std.fmt.allocPrint(alloc, " class=\"{s}\"", .{cls}) else "";
     try b.print(alloc, "<tr{s}><td>{s}</td><td class=\"n\">{d}</td><td class=\"n\">{d}</td><td class=\"n\">{d}</td><td class=\"n\">{s}</td><td>{s}</td></tr>", .{
-        row_class,            try chat.htmlEscape(alloc, st.name),
+        row_class,            try html.htmlEscape(alloc, st.name),
         st.game_sessions,     st.puzzle_sessions,
         st.total_actions,     try humanBytes(alloc, st.disk_bytes),
         actions_cell,
@@ -207,10 +285,10 @@ fn writeStatsRow(b: *std.ArrayList(u8), alloc: Alloc, st: UserStats, cls: []cons
 /// will be removed before the POST that does it.
 fn renderDeleteConfirm(req: *Request, io: Io, alloc: Alloc, id: []const u8) !void {
     const st = gatherUserStats(io, alloc, id);
-    const name = try chat.htmlEscape(alloc, try users.getUserName(io, alloc, id));
+    const name = try html.htmlEscape(alloc, try users.getUserName(io, alloc, id));
     const disk = try humanBytes(alloc, st.disk_bytes);
     const page = try std.fmt.allocPrint(alloc, delete_confirm_template, .{
-        name, st.game_sessions, st.puzzle_sessions, st.total_actions, disk, try chat.htmlEscape(alloc, id),
+        name, st.game_sessions, st.puzzle_sessions, st.total_actions, disk, try html.htmlEscape(alloc, id),
     });
     try req.respond(page, .{ .extra_headers = &.{http.html_ct} });
 }
@@ -319,16 +397,6 @@ fn humanBytes(alloc: Alloc, n: i64) ![]const u8 {
     return std.fmt.allocPrint(alloc, "{d:.1} {c}B", .{ val, "KMGTPE"[exp] });
 }
 
-fn queryValue(target: []const u8, name: []const u8) ?[]const u8 {
-    const q = std.mem.indexOfScalar(u8, target, '?') orelse return null;
-    var it = std.mem.splitScalar(u8, target[q + 1 ..], '&');
-    while (it.next()) |pair| {
-        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
-        if (std.mem.eql(u8, pair[0..eq], name)) return pair[eq + 1 ..];
-    }
-    return null;
-}
-
 fn nowUnix(io: Io) i64 {
     return @intCast(@divFloor(Io.Clock.now(.real, io).nanoseconds, std.time.ns_per_s));
 }
@@ -372,6 +440,13 @@ const member_table_head =
     \\<p class="muted">Members (password holders): time since last activity, lifetime image-upload total (vs the per-user cap), and a bot API key (acts as the member, no admin).</p>
     \\<table>
     \\<tr><th>Name</th><th>Last active</th><th class="n">Images</th><th>API key</th></tr>
+;
+
+const name_only_table_head =
+    \\<h2>Name-only users</h2>
+    \\<p class="muted">Accounts with a name but no password — guests minted at the blog-comment box or the guest-login flow. "Last active" spans every surface (a guest's are Lyn Rummy and comments); moves and games are their Lyn Rummy play, comments are tallied by name. The roster the archive tool draws from.</p>
+    \\<table>
+    \\<tr><th>Name</th><th>Last active</th><th class="n">Games</th><th class="n">Moves</th><th class="n">Comments</th><th class="n">Disk</th></tr>
 ;
 
 // delete_confirm_template. Args: name, games, puzzles, actions, disk, id.

@@ -20,6 +20,7 @@
      quote-reply button       → deps.onQuote(record)     (affects compose)
      refer button             → deps.onRefer(record)     (affects compose)
      edit button              → deps.onEdit(record)      (affects compose)
+     save button              → deps.onSave(record)      (save to reading list)
      external <a> / plain     → no-op (browser default + bubble up)
 
    The record passed to onQuote/onRefer/onEdit is the same SSE payload
@@ -74,11 +75,13 @@ window.Message = (function(){
       + '.chat-msg.theirs { background:var(--cc-theirs-bg); margin-right:auto; }'
       /* Meta line + action buttons. */
       + '.chat-meta { font-size:11px; color:var(--cc-muted-fg); margin-bottom:3px; }'
-      + '.chat-meta .msg-quote, .chat-meta .msg-refer, .chat-meta .msg-edit {'
+      + '.chat-meta .msg-quote, .chat-meta .msg-refer, .chat-meta .msg-edit, .chat-meta .msg-save {'
       +   ' font-size:10px; color:var(--cc-muted-fg); background:none; border:none;'
       +   ' padding:0 2px; cursor:pointer; text-decoration:underline; }'
-      + '.chat-meta .msg-quote:hover, .chat-meta .msg-refer:hover, .chat-meta .msg-edit:hover {'
+      + '.chat-meta .msg-quote:hover, .chat-meta .msg-refer:hover, .chat-meta .msg-edit:hover, .chat-meta .msg-save:hover {'
       +   ' color:var(--cc-accent); }'
+      /* Already-in-your-reading-list: a green status (still clickable to re-save). */
+      + '.chat-meta .msg-save.saved { color:var(--cc-saved-fg); text-decoration:none; }'
       /* Timestamp is clickable → multi-zone popup. */
       + '.chat-meta .chat-time { cursor:pointer; text-decoration:underline dotted; }'
       + '.chat-meta .chat-time:hover { color:var(--cc-accent); }'
@@ -107,6 +110,10 @@ window.Message = (function(){
       + '.chat-body img {'
       +   ' max-width:100%; max-height:320px; width:auto; height:auto;'
       +   ' display:block; margin:6px 0; border-radius:6px; cursor:zoom-in; }'
+      /* Screencasts: bounded to the bubble width with native controls (no
+         zoom-click — that's IMG-only). max-height keeps a tall clip in check. */
+      + '.chat-body video {'
+      +   ' max-width:100%; max-height:480px; display:block; margin:6px 0; border-radius:6px; }'
       /* Supersession spoiler (Edit of MSG_<id>). */
       + '.chat-edited-note { font-size:12px; color:var(--cc-muted-fg); margin-bottom:4px; }'
       + '.chat-edited-spoiler > summary {'
@@ -164,9 +171,21 @@ window.Message = (function(){
     var onQuote  = deps.onQuote  || function(){};
     var onRefer  = deps.onRefer  || function(){};
     var onEdit   = deps.onEdit   || function(){};
+    var onSave   = deps.onSave   || function(){};
     var onMsgRef = deps.onMsgRef || function(){};
 
     var bubble = null;
+    var saveBtn = null;
+
+    /* The save button doubles as the "already in your reading list" indicator:
+       'save' normally, '✓ saved' (green) when this message is in the set. Stays
+       clickable either way — re-save is allowed (no dedup). chat.js flips it via
+       setSaved() once the per-topic saved-set arrives, or after a confirmed save. */
+    function applySaved(isSaved){
+      if(!saveBtn) return;
+      saveBtn.textContent = isSaved ? '✓ saved' : 'save';
+      saveBtn.classList.toggle('saved', !!isSaved);
+    }
 
     // lint:called-once dom-builder-abstraction
     function buildMeta(){
@@ -188,6 +207,11 @@ window.Message = (function(){
       var edit=document.createElement('button'); edit.type='button'; edit.className='msg-edit';
       edit.title='Load this message back into compose with an "Edit of MSG_…" backlink (e)'; edit.textContent='edit';
       meta.appendChild(edit);
+      meta.appendChild(document.createTextNode(' '));
+      saveBtn=document.createElement('button'); saveBtn.type='button'; saveBtn.className='msg-save';
+      saveBtn.title='Save this message to your reading list (s)';
+      meta.appendChild(saveBtn);
+      applySaved(!!data.saved); /* initial state from the record */
       return meta;
     }
     /* PRODUCT_DECISION: one listener per bubble. The walk-up classification
@@ -201,6 +225,7 @@ window.Message = (function(){
       if(t.closest && t.closest('.msg-quote')){ onQuote(data); return; }
       if(t.closest && t.closest('.msg-refer')){ onRefer(data); return; }
       if(t.closest && t.closest('.msg-edit')){  onEdit(data);  return; }
+      if(t.closest && t.closest('.msg-save')){  onSave(data);  return; }
       if(!t.closest || !t.closest('.chat-body')) return;
       var hit = classifyBodyClick(t);
       if(hit.kind === 'image'){ ChatImagePopup.show(hit.src); return; }
@@ -246,6 +271,7 @@ window.Message = (function(){
     return {
       render:     render,
       markEdited: markEdited,
+      setSaved:   applySaved,
       getElement: function(){ return bubble; },
     };
   }

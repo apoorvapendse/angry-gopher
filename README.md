@@ -1,15 +1,34 @@
 # Angry Gopher
 
-A small, dependency-light server that hosts **Lyn Rummy** (a
-single-human card game — Elm client + TypeScript agent) and a private
-**chat** surface, plus a small admin view. Storage is plain files on
-disk — **no database**. In prod it ships as one self-contained
-embedded binary behind Caddy (TLS) under systemd; see
-[`deploy/README.md`](deploy/README.md).
+This is the source for **[lynrummy.com](https://lynrummy.com)** — Steve
+Howell's personal website. Every line of code here was written by Claude.
+"Angry Gopher" is a dated inside joke; don't ask.
+
+The site is a handful of small apps served from **one self-contained zig
+binary** — no database, storage is plain files on disk, deployed behind
+Caddy (TLS) under systemd. Each app has its own README as the canonical
+home for its design intent; this file is the developer/agent map of the
+whole thing.
+
+## The apps
+
+The home page (`/`) is a launch pad for seven apps. In display order:
+
+| App | Path | What it is | Stack | README |
+|---|---|---|---|---|
+| **Seattle Delivery** | `/delivery` | A CVRP route-planning sim — eight trucks fan out across a not-to-scale Seattle. Watch a hand-built Clarke-Wright solver think. A Zig solver (compiled to WASM) plans the routes; the TS client draws and animates them. | Zig (WASM) + TS | [`delivery/README.md`](delivery/README.md) |
+| **Safari Screensaver** | `/driving` | A self-driving first-person motorcycle ride down a winding road, drawn from rider-relative coordinates. A Zig core (compiled to WebAssembly) computes the geometry; a tiny JS blitter fills the polygons. | Zig (WASM) + JS | [`games/driving/README.md`](games/driving/README.md) |
+| **Chat** | `/chat` | Real-time chat, docs, and channels over Server-Sent Events — the live surface we use daily; a multi-page app still mostly rendered on the front end. | JavaScript + Zig | [`chat/README.md`](chat/README.md) |
+| **Blog** | `/blog` | Notes on building the site, rendered from repo markdown by a hand-written engine. | Zig | [`blog/README.md`](blog/README.md) |
+| **Lyn Rummy** | `/game` | Two-player rummy against an agent that knows the rules — a Zig solver (compiled to WASM) picks the plays and hints, a TS layer turns them into table gestures, an Elm UI plays them, all speaking a DSL over the wire. | Zig (WASM) + Elm + TS | [`games/lynrummy/README.md`](games/lynrummy/README.md) |
+| **Lyn Rummy Puzzles** | `/puzzles` | A single mid-game board to solve; shares the solver and rules, with deterministic undo and replay. | Zig (WASM) + Elm + TS | [`games/lynrummy/elm/src/Puzzle/README.md`](games/lynrummy/elm/src/Puzzle/README.md) |
+| **Chess Toys** | `/chess` | The newest addition: Knight's Tour and Eight Queens as watchable, scrubbable backtracking searches — each search narrates onto an event tape, and the sources themselves are exhibited at `/chess/code`. | Zig (WASM) + JS | [`games/chess/README.md`](games/chess/README.md) |
 
 > **The server is the zig implementation in [`zig-server/`](zig-server/)** —
 > see [`SERVER.md`](SERVER.md). (It was ported from a Go original, now removed;
 > the routes, layout, and DSL below describe the live zig server.)
+
+The rest of this README is for developers and agents working on the code.
 
 ## Quick start
 
@@ -35,9 +54,9 @@ We pin these versions:
 
 | Tool | Version | Builds | Install |
 |---|---|---|---|
-| **Zig** | 0.16.0 | the server (`zig-server/`) | system install — `zig version` |
+| **Zig** | 0.16.0 | the server (`zig-server/`) + the Lyn Rummy solver's WASM build (`games/lynrummy/zig/` → `solver.wasm`) + the Safari Screensaver's WASM core (`games/driving/wasm/` → `games/driving/safari.wasm`) + the Delivery solver's WASM build (`delivery/zig/` → `delivery/solver.wasm`) + the Chess Toys' WASM cores (`games/chess/*.zig` → `games/chess/*.wasm`) | system install — `zig version` |
 | **Elm** | 0.19.1 | the Lyn Rummy client | `npm install` in `games/lynrummy/elm/` (pinned in its `package.json`) |
-| **TypeScript** | 6.0.3 | the agent + game engine | `npm install` in `games/lynrummy/ts/` (pinned in its `package.json`) |
+| **TypeScript** | 6.0.3 | the Delivery display client + the Lyn Rummy DSL/geometry layer and test harnesses (both solvers are now zig; each `.ts` solver stays as the port reference) | `npm install` in `delivery/` and `games/lynrummy/ts/` (pinned in each `package.json`) |
 | **Node** | 24 | runs the TS directly + hosts the npm-installed `elm`/`tsc` | system install — `node --version` |
 
 TypeScript runs two ways, and only one of them is transpiled:
@@ -45,19 +64,30 @@ TypeScript runs two ways, and only one of them is transpiled:
 - **Node-side** — the agent solver and its tests run the `.ts` files
   *directly* via Node's type-stripping, never transpiled (so a Node new
   enough for that is required; dev uses v24).
-- **Browser-side** — the driving game (`games/driving/main.ts`) and the
-  Lyn Rummy engine (`games/lynrummy/ts/elm_api/engine_entry.ts`) **are**
-  transpiled: `esbuild` bundles each into one IIFE JS file
-  (`games/driving/app.js`, `games/lynrummy/elm/engine.js`), and those
-  bundles — alongside the Elm output — are `@embedFile`d into the zig
-  binary at compile time. `ops/build_driving` / `ops/build_engine_js` run
-  this; `esbuild` is fetched on demand via `npx --yes` (unpinned, not a
-  project install).
+- **Browser-side** — two bundles **are** transpiled (`esbuild` bundles
+  each into one IIFE JS file, `@embedFile`d into the zig binary at compile
+  time), and both now pair with a zig brain. The Delivery sim
+  (`delivery/main.ts` → `delivery/app.js`) builds its own canvas and owns
+  the whole display — but the *solver* runs in `delivery/solver.wasm`
+  (`delivery/zig/`, `ops/build_delivery_wasm`), which the bundle calls for
+  each shift's plan. The Lyn Rummy engine bundle
+  (`games/lynrummy/ts/elm_api/engine_entry.ts` → `games/lynrummy/elm/engine.js`)
+  is a supporting layer, not a client — the *thinking* (hints, futility
+  certificates, the agent opponent) lives in the zig solver compiled to
+  `solver.wasm`, and the TS bundle translates its answers into the DSL and
+  table gestures (locations, drag paths) while Elm owns the UI. `ops/build_delivery` / `ops/build_engine_js` run these (alongside the
+  Elm output); `esbuild` is a pinned local devDependency (calling its binary
+  directly skips `npx`'s ~1s-per-call resolution tax). (The Safari Screensaver
+  *used* to be a pure-TS client too; it's now a Zig→WASM core + a JS blitter
+  — `ops/build_safari_wasm` — and no longer transpiled. Each toy's `.ts`
+  source is kept as the port reference; see `HISTORY.md` for who sits where
+  on the zig↔TS spectrum and why.)
 
 `tsc` itself only ever typechecks (`npm run typecheck`) — it never emits
-the JS that ships. Elm and `tsc` are project-local (run from each
-package's `node_modules/.bin`), so a fresh checkout needs `npm install`
-in both `games/lynrummy/elm/` and `games/lynrummy/ts/`.
+the JS that ships. Elm, `tsc`, and `esbuild` are all project-local (run
+from each package's `node_modules/.bin`), so a fresh checkout needs
+`npm install` in `games/lynrummy/elm/`, `games/lynrummy/ts/`, and
+`delivery/`.
 
 ## Local config & identity
 
@@ -67,7 +97,7 @@ line) is ignored; the listen port is hardcoded to `:9001` in
 `zig-server/src/server.zig`.
 
 ```
-data_dir = /home/steve/AngryGopher/prod   # all writable state lives here
+data_dir = /home/steve/AngryGopher/local  # all writable state lives here
 auth_dir = /home/steve/Auth               # account store; defaults to ~/Auth
 ```
 
@@ -77,6 +107,46 @@ auth_dir = /home/steve/Auth               # account store; defaults to ~/Auth
 allocation. One uid is the same person across every surface. With the
 config above, `~/Auth/1` resolves to **Steve (uid 1)**, so a browser hits
 `/chat` as Steve rather than getting bounced to `/login`.
+
+**Policy: keep server data OUTSIDE the repository.** Point `data_dir` and
+`auth_dir` at paths outside the source tree (e.g. `~/AngryGopher/…` and
+`~/Auth`, as above) — never inside the checkout. The tree stays freely
+rm-able without touching data, accounts/credentials never risk being
+committed, and there's nothing to `.gitignore`. The config file itself
+also lives outside the repo (`ops/start` defaults to
+`~/AngryGopher/gopher.conf`).
+
+### User types & the identity progression
+
+The site optimizes for frictionless exploration, asking for a password
+only where it must — at the chat boundary, which holds private data. That
+produces a natural progression:
+
+**STRANGER → GUEST → FULL MEMBER**
+
+- **Stranger** — no cookie, no account. Can browse public surfaces (e.g.
+  `/driving`).
+- **Guest** — a name, no password (`{auth_dir}/<id>/` has `name` only).
+  You become one by entering a name at `/login`; enough to play **Lyn
+  Rummy**, which needs a unique name to track game history but no
+  password. Names are unique, so a guest can't take a member's name.
+- **Full member** — a guest who has set a password (`name` + `password`),
+  or a stranger who registered directly. Required for **chat**. A guest
+  upgrades *in place* — same uid, so game history carries over.
+
+Many users skip the middle step and go **straight from stranger to full
+member** — anyone who heads to chat without playing Lyn Rummy first. The
+`/login/full` page handles all three on-ramps (see `login.zig`): a
+stranger picks *Log in* or *Create account*; a cookied guest just sets a
+password; an existing member verifies one.
+
+Two accounts stand apart from this progression:
+
+- **Admin** — **uid 1** (Steve). The first account; `/admin` is
+  hardcoded to uid 1 (`admin.zig`), not a per-account flag.
+- **Agent** — **uid 3** (Claude). A full member that authenticates by API
+  key instead of a browser session (read + write, never admin). See
+  "Reading chat as the agent" below.
 
 ### Bootstrapping a fresh environment
 
@@ -152,21 +222,33 @@ against `http://localhost:9001`, and the prod key against
 
 ## Routes
 
+The authoritative dispatch is `route()` in `zig-server/src/server.zig`
+(one prefix match per surface — read it for the full story). The map:
+
 | Path | What |
 |---|---|
-| `/` | Home / launch pad |
-| `/game`, `/game/<id>`, `/game/sessions` | Full-game Elm client + session storage |
-| `/puzzles` | Single-board puzzle client |
-| `/chat` | Private one-on-one chat (members only) |
-| `/settings` | Per-user settings (read-only bot API key) |
+| `/` | Home / launch pad (public; viewer resolved for the top bar, never gated) |
+| `/delivery` | Seattle Delivery sim (public) |
+| `/driving`, `/safari_download`, `/downloads` | Safari Screensaver + its native-download landing page and artifacts (public) |
+| `/chess` | Chess Toys: `/chess/knight`, `/chess/queens`, sources at `/chess/code` (public) |
+| `/game`, `/puzzles`, `/tutorial` | Lyn Rummy: full game (guest name required), puzzle client, beginner tutorial (tutorial public) |
+| `/chat`, `/channel/<name>` | DMs + channels over SSE, `/chat/docs` authoring (members only) |
+| `/blog` | Blog (public; posting a comment mints a guest) |
+| `/learn` | Interactive site tutorial (public) |
+| `/settings` | Per-user settings incl. API-key generation (members) |
 | `/login`, `/login/full`, `/logout` | Guest name login / member password login |
-| `/admin` | Session + user overview (requires the admin flag) |
-| `/version` | Build version JSON |
+| `/admin` | Session + user overview (hardcoded to uid 1) |
+| `/gallery`, `/images` | Home-page app emblems / brand assets (public) |
+| `/steve-resume` | Server-owned markdown page + pre-built PDF |
+| `/version`, `/debug/mem` | Build version JSON; live allocator counters (the leak smoke detector) |
 
-Every request goes through a login gate: no resolvable
-identity → redirect to `/login`. Login sets a `gopher_uid` cookie;
-members additionally get a signed session cookie. Bot **API keys are
-read-only** — a keyed request may only GET/HEAD.
+There is no site-wide login gate — most surfaces are deliberately
+public and ungated (they resolve the viewer only to label the top
+bar). The gates that exist are per-surface: Lyn Rummy asks for a guest
+name, chat requires a full member. Login sets a `gopher_uid` cookie;
+members additionally get a signed session cookie. An **API key**
+(`Authorization: Bearer`) resolves to its principal exactly like a
+session — read + write as that uid, never admin.
 
 ## Layout
 
@@ -174,44 +256,42 @@ read-only** — a keyed request may only GET/HEAD.
 |---|---|
 | [`zig-server/`](zig-server/) | **the server (zig)** — every surface (home, login, chat, docs, Lyn Rummy `/game` + `/puzzles`, driving, `/admin`, `/settings`) as per-module handlers in `src/*.zig` over the shared data tree; front-end assets embedded via `build.zig`. See [`SERVER.md`](SERVER.md). |
 | `chat/` | the embedded chat **client** (`chat.js`) + the reference API client / example bot (`chat_client.py`: discover, read, post) |
+| `delivery/` | the Delivery display client (TS) + `delivery/zig/` — the CVRP solver, compiled to `solver.wasm`, gated bit-exact against the retired TS solver (`ops/check_delivery`) |
 | `games/lynrummy/elm/` | the autonomous Elm client (dealer + referee + UI) |
-| `games/lynrummy/ts/` | the TypeScript agent — the strategic brain (solver + self-play) |
+| `games/lynrummy/zig/` | the solver — the strategic brain (hints, certificates, Player Two, self-play sim), compiled to `solver.wasm` for the browser |
+| `games/lynrummy/ts/` | the original TypeScript engine, mostly retired — still the DSL/geometry layer (gesture choreography for the zig solver's plays) + the self-play harness |
 | `ops/` | the build / run / test scripts (`ops/list` enumerates them) |
 | `deploy/` | Caddyfile, systemd unit, deploy runbook |
 
-The server is dumb URL-keyed file storage; the strategic brain is the
-TS agent, and the Elm client owns the full game (dealer, referee, UI).
+The server stays deliberately dumb — URL-keyed file storage plus the
+per-surface handlers — and pushes logic to the client wherever it can.
+Lyn Rummy is the clearest case: the strategic brain is the zig solver
+running as WASM in the browser, the TS layer turns its answers into table
+gestures, and the Elm client owns the full game (dealer, referee, UI). Its
+[`README`](games/lynrummy/README.md) covers that split and the
+DSL-over-the-wire idea in full.
 
-## The DSL is the lingua franca
-
-One short, canonical DSL carries the same grammar across all three
-runtimes — conformance fixtures, on-disk session files (`meta`,
-`actions.dsl`), the new-session wire body, the resume bundle, and agent
-transcripts. Sample session header:
-
-```
-created_at: 1778500538
-label:
-
-board:
-  at ( 20,  70): K♠ A♠ 2♠ 3♠
-  ...
-```
-
-Full grammar tour + examples live in
-[`games/lynrummy/ARCHITECTURE.md`](games/lynrummy/ARCHITECTURE.md)
-under "DSL is the lingua franca". Most parsing happens at test time;
-conformance is gated by `ops/check`.
+**Responsive / mobile** (the chat surfaces — our mobile user is Apoorva;
+Steve is desktop-only). Small-screen layout is decided client-side. One JS
+authority, `Viewport` (`chat/viewport.js`), owns the single breakpoint and
+exposes it two ways — an `html.vp-narrow` class for CSS and `onChange` for
+JS — so the number lives in exactly one place. The shared nav drawer
+(`chrome_drawer.js`) and the chat page's mobile layout (`chat_responsive.js`)
+both key off it; the server (`chrome.zig`) just ships the desktop top bar and
+loads the widgets. Start at `Viewport` and follow the breadcrumbs.
 
 ## Ops & testing
 
 ```
 ops/start              Start the zig server on :9001 (rebuild + relaunch)
 ops/list               List ops commands
-ops/check              Pre-commit gate (~35s warm): check_zig + test_ts + test_elm + test_docs + test_css
+ops/check              Pre-commit gate (~40s warm): check_common + test_elm + test_ts + test_chat + check_safari + check_chess + check_solver
 ops/check_full         Milestone gate: ops/check + agent self-play
 ops/check_zig          zig server compiles + unit tests (~6s)
 ops/check_markdown     Markdown dialect regression (~3s)
+ops/check_delivery     Delivery zig-solver conformance (~30s warm): native
+                       gold check + the built solver.wasm driven over every
+                       gold shift (standalone; run after delivery/ edits)
 ops/test_ts            Fast TS gate (~15s)
 ops/test_elm           Fast Elm gate (~4s)
 ops/test_docs          Fast docs gate (~1s): doc_xref --all (dead links/paths)
@@ -226,10 +306,9 @@ consistency checks that bare commands silently skip.
 
 | Looking for… | Read |
 |---|---|
-| Lyn Rummy docs (top of tree) | [`games/lynrummy/README.md`](games/lynrummy/README.md) |
-| Rules of the game | [`games/lynrummy/RULES.md`](games/lynrummy/RULES.md) |
-| Load-bearing design decisions | [`games/lynrummy/ARCHITECTURE.md`](games/lynrummy/ARCHITECTURE.md) |
-| Build pipeline | [`games/lynrummy/BUILDING.md`](games/lynrummy/BUILDING.md) |
+| Any one app's design intent | its README — see [The apps](#the-apps) above |
+| The server internals (routing, modules) | [`SERVER.md`](SERVER.md) |
+| Lyn Rummy rules / architecture | [`games/lynrummy/RULES.md`](games/lynrummy/RULES.md), [`games/lynrummy/ARCHITECTURE.md`](games/lynrummy/ARCHITECTURE.md) |
 | Deploy / host setup | [`deploy/README.md`](deploy/README.md) |
 | Agent-collaboration conventions | `~/showell_repos/claude-collab/agent_collab/` |
 

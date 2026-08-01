@@ -1,4 +1,9 @@
 // =============================================================================
+// DEPRECATED. This TypeScript implementation is no longer built or served — the
+// live /driving is the Zig→WASM core in ./wasm/ (*.zig + blitter.js). These .ts
+// files are kept only as the historical port reference. New work goes in ./wasm/.
+// See ./README.md.
+// =============================================================================
 // main — canvas. The frame loop is: take the current RiderState, build the
 // Rider-relative scene (view.ts), and draw it. The Rider is advanced EXPLICITLY
 // by getNextRiderState (rider.ts) before drawing — that next RiderState is what
@@ -57,6 +62,18 @@ timer.style.cssText =
   'background:rgba(0,0,0,0.32);font-size:17px;color:#9aa0a6;letter-spacing:0.5px;' +
   'font-variant-numeric:tabular-nums;pointer-events:none;';
 wrap.appendChild(timer);
+
+// A "Home" link in the lower-left — the navigation escape hatch back to the app
+// launcher. Built as a DOM overlay on a faint plate, matching the hint + timer
+// corner chrome (the app's idiom), so it's a real anchor (keyboard-focusable) that
+// balances the count-up clock in the opposite corner and stays legible over grass.
+const home = document.createElement('a');
+home.textContent = 'Home';
+home.href = '/';
+home.style.cssText =
+  'position:absolute;left:12px;bottom:10px;padding:4px 11px;border-radius:4px;' +
+  'background:rgba(0,0,0,0.32);font-size:14px;color:#8fd0e6;text-decoration:none;letter-spacing:0.5px;';
+wrap.appendChild(home);
 
 const ctx = canvas.getContext('2d') as CanvasRenderingContext2D;
 const W = canvas.width;

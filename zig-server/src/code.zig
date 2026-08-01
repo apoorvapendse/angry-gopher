@@ -12,7 +12,9 @@ const users = @import("users.zig");
 const store = @import("chat_store.zig");
 const code_store = @import("code_store.zig");
 const images_store = @import("images_store.zig");
-const chat = @import("chat.zig");
+const chat_sse = @import("chat_sse.zig");
+const chrome = @import("chrome.zig");
+const html = @import("html.zig");
 const Bus = @import("bus.zig").Bus;
 
 const Alloc = std.mem.Allocator;
@@ -23,7 +25,7 @@ const Request = std.http.Server.Request;
 pub fn handle(req: *Request, io: Io, alloc: Alloc, bus: *Bus, uid: []const u8, rest: []const u8) !void {
     if (rest.len == 0) return renderCodePage(req, io, alloc, uid);
     if (std.mem.eql(u8, rest, "/stream")) {
-        return chat.forwardUserStream(req, alloc, bus, try store.codeBusKey(alloc, uid));
+        return chat_sse.forwardUserStream(req, alloc, bus, try store.codeBusKey(alloc, uid));
     }
     return http.notFound(req);
 }
@@ -33,15 +35,15 @@ fn renderCodePage(req: *Request, io: Io, alloc: Alloc, uid: []const u8) !void {
     const entries = try code_store.readCodeForUser(io, alloc, uid);
 
     var b: std.ArrayList(u8) = .empty;
-    try chat.writeChrome(&b, alloc, "Code", "Code", viewer, "code");
+    try chrome.begin(&b, alloc, "Code", "Code", viewer, "code");
     try b.appendSlice(alloc, "<div class=\"chat-notify\" id=\"chat-notify\"></div>");
     try b.appendSlice(alloc, "<div id=\"code-mount\"></div>");
     try emitCodeData(&b, alloc, entries);
     try b.print(alloc, "<script src=\"/chat/styles.js?v={s}\"></script>" ++
         "<script src=\"/chat/chat_code_popup.js?v={s}\"></script>" ++
         "<script src=\"/chat/code.js?v={s}\"></script>" ++
-        "<script src=\"/chat/notify.js?v={s}\"></script>", .{ chat.asset_v, chat.asset_v, chat.asset_v, chat.asset_v });
-    try b.appendSlice(alloc, "</div></body></html>"); // close .app-body-wrap (PageFooter)
+        "<script src=\"/chat/notify.js?v={s}\"></script>", .{ chrome.asset_v, chrome.asset_v, chrome.asset_v, chrome.asset_v });
+    try chrome.end(&b, alloc);
 
     try req.respond(b.items, .{ .extra_headers = &.{http.html_ct} });
 }
@@ -59,16 +61,9 @@ fn emitCodeData(b: *std.ArrayList(u8), alloc: Alloc, entries: []code_store.CodeE
         try code_store.encodeCodeEvent(&j, alloc, e, src);
     }
     try j.append(alloc, ']');
-    const safe = try replaceSeq(alloc, j.items, "</", "<\\/");
+    const safe = try html.scriptSafe(alloc, j.items);
     try b.appendSlice(alloc, "<script id=\"code-data\" type=\"application/json\">");
     try b.appendSlice(alloc, safe);
     try b.appendSlice(alloc, "</script>");
 }
 
-/// replaceSeq returns `input` with every `needle` replaced by `repl` (alloc-owned).
-fn replaceSeq(alloc: Alloc, input: []const u8, needle: []const u8, repl: []const u8) ![]u8 {
-    const n = std.mem.replacementSize(u8, input, needle, repl);
-    const out = try alloc.alloc(u8, n);
-    _ = std.mem.replace(u8, input, needle, repl, out);
-    return out;
-}

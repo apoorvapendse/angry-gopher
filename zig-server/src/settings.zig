@@ -13,6 +13,8 @@ const Alloc = std.mem.Allocator;
 const http = @import("http.zig");
 const users = @import("users.zig");
 const chat = @import("chat.zig");
+const chrome = @import("chrome.zig");
+const html = @import("html.zig");
 const presence = @import("presence.zig");
 const Bus = @import("bus.zig").Bus;
 
@@ -48,9 +50,9 @@ fn handleAPIKey(req: *Request, io: Io, alloc: Alloc, uid: []const u8) !void {
 fn renderSettings(req: *Request, io: Io, alloc: Alloc, uid: []const u8) !void {
     const viewer = try users.getUserName(io, alloc, uid);
     var b: std.ArrayList(u8) = .empty;
-    try chat.writeChrome(&b, alloc, "Settings", "Settings", viewer, "settings");
+    try chrome.begin(&b, alloc, "Settings", "Settings", viewer, "settings");
 
-    if (queryFlag(req, "keyrevoked")) {
+    if (try queryFlag(req, alloc, "keyrevoked")) {
         try b.appendSlice(alloc, "<p class=\"flash\">Your API key was revoked.</p>");
     }
 
@@ -59,14 +61,14 @@ fn renderSettings(req: *Request, io: Io, alloc: Alloc, uid: []const u8) !void {
     if (!users.userHasAPIKey(io, alloc, uid)) {
         try b.appendSlice(alloc, "<p>You don't have an API key yet.</p>\n" ++
             "<form method=\"post\" action=\"/settings/apikey\" style=\"display:inline\"><button type=\"submit\">Generate key</button></form>");
-        try b.appendSlice(alloc, "</div></body></html>");
+        try chrome.end(&b, alloc);
         return req.respond(b.items, .{ .extra_headers = &.{http.html_ct} });
     }
 
     // Has a key. Reveal it on ?show=1; otherwise just the buttons.
-    if (queryFlag(req, "show")) {
+    if (try queryFlag(req, alloc, "show")) {
         if (try users.getUserAPIKey(io, alloc, uid)) |key| {
-            try b.print(alloc, "<p>Your API key (copy it somewhere safe):</p>\n<code style=\"" ++ key_code_style ++ "\">{s}</code>", .{try chat.htmlEscape(alloc, key)});
+            try b.print(alloc, "<p>Your API key (copy it somewhere safe):</p>\n<code style=\"" ++ key_code_style ++ "\">{s}</code>", .{try html.htmlEscape(alloc, key)});
         } else {
             try b.appendSlice(alloc, "<p class=\"muted\">This key predates the show feature — regenerate it to see the value.</p>");
         }
@@ -74,7 +76,7 @@ fn renderSettings(req: *Request, io: Io, alloc: Alloc, uid: []const u8) !void {
         try b.appendSlice(alloc, "<p>You have an API key.</p>");
     }
     try b.appendSlice(alloc, key_buttons_html);
-    try b.appendSlice(alloc, "</div></body></html>");
+    try chrome.end(&b, alloc);
     return req.respond(b.items, .{ .extra_headers = &.{http.html_ct} });
 }
 
@@ -82,10 +84,10 @@ fn renderSettings(req: *Request, io: Io, alloc: Alloc, uid: []const u8) !void {
 /// A standalone page (not chat chrome); the back link points at whichever surface
 /// generated it (member /settings or the /admin panel). Shared with admin.zig.
 pub fn renderKeyShown(req: *Request, io: Io, alloc: Alloc, uid: []const u8, key: []const u8, back_url: []const u8, back_label: []const u8) !void {
-    const name = try chat.htmlEscape(alloc, try users.getUserName(io, alloc, uid));
-    const safe_key = try chat.htmlEscape(alloc, key);
-    const url = try chat.htmlEscape(alloc, back_url);
-    const label = try chat.htmlEscape(alloc, back_label);
+    const name = try html.htmlEscape(alloc, try users.getUserName(io, alloc, uid));
+    const safe_key = try html.htmlEscape(alloc, key);
+    const url = try html.htmlEscape(alloc, back_url);
+    const label = try html.htmlEscape(alloc, back_label);
     const page = try std.fmt.allocPrint(alloc, key_shown_template, .{ url, label, name, safe_key });
     return req.respond(page, .{ .extra_headers = &.{http.html_ct} });
 }
@@ -93,20 +95,9 @@ pub fn renderKeyShown(req: *Request, io: Io, alloc: Alloc, uid: []const u8, key:
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 /// queryFlag reports whether the `?name=1` flag is present in the request target.
-fn queryFlag(req: *Request, name: []const u8) bool {
-    const v = queryValue(req.head.target, name) orelse return false;
+fn queryFlag(req: *Request, alloc: Alloc, name: []const u8) !bool {
+    const v = http.queryValue(try http.target(req, alloc), name) orelse return false;
     return std.mem.eql(u8, v, "1");
-}
-
-/// queryValue pulls one (un-decoded) query parameter from a raw request target.
-fn queryValue(target: []const u8, name: []const u8) ?[]const u8 {
-    const q = std.mem.indexOfScalar(u8, target, '?') orelse return null;
-    var it = std.mem.splitScalar(u8, target[q + 1 ..], '&');
-    while (it.next()) |pair| {
-        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
-        if (std.mem.eql(u8, pair[0..eq], name)) return pair[eq + 1 ..];
-    }
-    return null;
 }
 
 // ── page markup ───────────────────────────────────────────────────────────────

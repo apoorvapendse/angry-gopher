@@ -16,7 +16,7 @@
      refer, edit, search, navigateRef, onSelect, finishBacklog — because
      the data lives there. Message widgets only own the bubble DOM +
      click routing + in-place supersession; their public API is just
-     {render, markEdited, getElement}. byId indexes both arrays by
+     {render, markEdited, setSaved, getElement}. byId indexes both arrays by
      message id for O(1) lookup. Server-assigned index is 0-based; the
      view index is 1-based; the two stay consistent because we always
      append in order. */
@@ -26,6 +26,21 @@
   function recordById(id){ var i=byId.get(id); return i==null ? null : records[i]; }   // lint:null-undefined-check map-get
   // lint:called-once supersession-only — named to match recordById sibling
   function widgetById(id){ var i=byId.get(id); return i==null ? null : messages[i]; }  // lint:null-undefined-check map-get
+
+  /* ===== reading-list "already saved" set =====
+     The ids saved within THIS topic (per the server's mtime-cached parse). A
+     bubble shows '✓ saved' when its id is in here. Populated once on load and
+     extended on each confirmed save; new bubbles read it at render time, already-
+     rendered ones get flipped by markSaved. Cross-tab edits to the reading list
+     aren't reflected until reload (deliberate — keeping saves sticky is fine). */
+  var savedIds = new Set();
+  function markSaved(id){ savedIds.add(id); var w=widgetById(id); if(w) w.setSaved(true); }
+  function loadSavedSet(){  // lint:called-once load-once-on-init
+    fetch(SESSION_BASE+'/saved').then(function(r){ return r.ok ? r.json() : []; })
+      .then(function(ids){ for(var i=0;i<ids.length;i++) markSaved(ids[i]); })
+      .catch(function(){});
+  }
+  loadSavedSet();
 
   /* ===== domain actions (called from Message clicks AND ChatHelp keys) =====
      PRODUCT_DECISION: doQuote/doRefer/doEdit/navigateRef call pane.focusBubble,
@@ -71,6 +86,48 @@
     ChatCompose.setMarkdown(prefix+rec.markdown, prefix.length);
   }
 
+  /* PRODUCT_DECISION: save = snapshot this message into your reading-list doc.
+     The popup pre-fills "read later" (Enter accepts); on confirm we POST the
+     snapshot-as-seen (markdown body, author, viewer-zone date) plus the
+     conv/sid/id that locate the source. The server composes the durable block
+     and appends. Feedback lands in the existing #chat-notify status strip as a
+     link straight to the reading list (Docs) — consistent for click + the 's'
+     hotkey; a persistent per-message "saved" marker waits for read-back-state. */
+  function doSave(rec){
+    ChatSavePopup.show({ note: 'read later', onConfirm: function(note){ postSave(rec, note); } });
+  }
+  function postSave(rec, note){  // lint:called-once save POST helper
+    var params = new URLSearchParams();
+    params.set('conv', CONV);
+    params.set('sid',  SESSION);
+    params.set('id',   rec.id);
+    params.set('from', rec.from);
+    params.set('at',   Message.formatLocalTime(rec.at));
+    params.set('body', rec.markdown);
+    params.set('note', note);
+    fetch('/chat/docs/save_to_reading_list', {
+      method: 'POST',
+      headers: {'Content-Type':'application/x-www-form-urlencoded'},
+      body: params.toString(),
+    }).then(function(r){
+      /* Flip the bubble only on a CONFIRMED save — never optimistically. */
+      if(r.ok){ markSaved(rec.id); ChatNotify.show(savedStatus(rec.id)); }
+      else ChatNotify.show('Save failed');
+    }).catch(function(){ ChatNotify.show('Save failed'); });
+  }
+  /* "MSG_<id> saved to reading list (Docs)" with the destination linked —
+     /chat/docs/reading-list drops you straight into the doc (the server lands
+     a bare /chat/docs on your most-recent doc, which a save just became). */
+  function savedStatus(id){  // lint:called-once status-strip builder
+    var span = document.createElement('span');
+    span.appendChild(document.createTextNode('MSG_' + id + ' saved to '));
+    var a = document.createElement('a');
+    a.href = '/chat/docs/reading-list';
+    a.textContent = 'reading list (Docs)';
+    span.appendChild(a);
+    return span;
+  }
+
   /* ===== cross-session vs same-session MSG_ ref navigation =====
      PRODUCT_DECISION: cross-session refs open in a new tab via the
      /chat/msg/<id> lookup endpoint — the server resolves which conv
@@ -95,10 +152,12 @@
   pane = ChatMiddlePane.init({
     mount: document.getElementById('chat-feed'),
     renderBubble: function(idx, m){
+      m.saved = savedIds.has(m.id); /* initial indicator state, kept in sync via setSaved */
       var msg = Message.create(m, {
         onQuote:  doQuote,
         onRefer:  doRefer,
         onEdit:   doEdit,
+        onSave:   doSave,
         onMsgRef: navigateRef,
       });
       byId.set(m.id, records.length);
@@ -206,7 +265,7 @@
       ChatCompose.ackIfPending(m.cid);
       var link=document.createElement('a');
       link.href='#msg-'+m.id;
-      link.textContent='✓ '+m.id+' sent';
+      link.textContent='✓ your message was sent to '+m.id;
       link.addEventListener('click', function(e){
         e.preventDefault();
         var rec=recordById(m.id);
@@ -263,6 +322,7 @@
     quoteReply:  doQuote,
     referReply:  doRefer,
     editMessage: doEdit,
+    save:        doSave,
     /* Raw transcript = the literal on-disk .md file, opened in a new tab
        via the same server endpoint fetch_prod_transcript backs up from. */
     viewRaw:     function(){ window.open(SESSION_BASE + '/raw', '_blank'); },
@@ -277,5 +337,11 @@
       a.remove();
     },
   });
+  /* PRODUCT_DECISION: ChatResponsive owns the chat page's small-screen layout
+     (full-width feed, fixed bottom compose bar, and relocating the conversations
+     rail into the shared ChromeDrawer). Must run AFTER ChatLeftSidebar,
+     ChatRightSidebar, and ChatCompose so their mount elements exist. The shared
+     hamburger + nav drawer are ChromeDrawer's job (chrome_drawer.js, every page). */
+  ChatResponsive.init();
   ChatCompose.focus();
 })();

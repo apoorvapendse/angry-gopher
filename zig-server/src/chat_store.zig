@@ -118,9 +118,15 @@ fn unescapeBodyLine(line: []const u8) []const u8 {
 /// Stream is the result of openStream: the decoded backlog + a live Subscriber.
 /// The caller replays backlog[since..] then drains the subscriber, and MUST pair
 /// this with `bus.close(sub)` when the connection ends.
+///
+/// Two lifetimes deliberately bundled here — keep them straight:
+///   backlog: REQUEST-scoped. Decoded into openStream's arena `alloc`; valid only
+///            for this request and never stored past it (it's replayed, then dropped).
+///   sub:     SERVER-scoped. Owned by the bus on its base allocator; outlives the
+///            request until `bus.close(sub)` removes + frees it.
 pub const Stream = struct {
-    backlog: []ChatMessage,
-    sub: *bus_mod.Subscriber,
+    backlog: []ChatMessage, // request-arena: consume in-request, never retain
+    sub: *bus_mod.Subscriber, // bus-owned (base alloc): close it, don't free piecemeal
 };
 
 /// openStream: under chat_mu, decode the session backlog
@@ -177,14 +183,19 @@ pub fn appendMessage(io: Io, alloc: Alloc, bus: *Bus, meta: ConvMeta, conv_dir: 
     // per member, to their per-uid bus, plus a sidebar topic-added on the
     // session's first message. Best-effort; runs under chat_mu so the lock order
     // is chat_mu → imagesMu (leaf).
-    fanoutCrossPage(io, alloc, bus, meta, conv_key, sid, msg, index);
+    fanoutCrossPage(io, alloc, bus, meta, conv_key, sid, msg, from_id, index);
 
     return msg;
 }
 
-/// ConvKind discriminates the two conversation shapes for the fanout (DM "where"
-/// names the other party; channel "where" names the channel).
-pub const ConvKind = enum { dm, channel };
+/// ConvKind discriminates the conversation shapes for the fanout (DM "where"
+/// names the other party; channel "where" names the channel). `blog_comment` is a
+/// public, MEMBERLESS thread: because the cross-page fanout is keyed
+/// `for (members)`, an empty member list means a comment never reaches anyone's
+/// private notify/Recent/Images/Code feeds — the kind isn't tested on that path,
+/// it just rides the empty loop. It exists so a comment Conv tells the truth
+/// rather than masquerading as a `.dm`.
+pub const ConvKind = enum { dm, channel, blog_comment };
 
 /// ConvMeta carries what the cross-page fanout needs that the storage path
 /// doesn't otherwise know: the conv kind and its member uids (recipients).
@@ -227,7 +238,7 @@ pub fn convKeyBaseURL(alloc: Alloc, conv_key: []const u8) ![]u8 {
 /// code (per-user transcripts) per member, plus a sidebar topic-added on the
 /// session's FIRST message (index == 0). Best-effort: a failure for one
 /// member/surface is swallowed so it never blocks the write.
-fn fanoutCrossPage(io: Io, alloc: Alloc, bus: *Bus, meta: ConvMeta, conv_key: []const u8, sid: []const u8, msg: ChatMessage, index: usize) void {
+fn fanoutCrossPage(io: Io, alloc: Alloc, bus: *Bus, meta: ConvMeta, conv_key: []const u8, sid: []const u8, msg: ChatMessage, from_id: []const u8, index: usize) void {
     const base = convKeyBaseURL(alloc, conv_key) catch return;
     const rec_url = std.fmt.allocPrint(alloc, "{s}/{s}", .{ base, sid }) catch return;
     const excerpt = recent_feed.recentExcerpt(alloc, msg.markdown) catch "";
@@ -251,15 +262,22 @@ fn fanoutCrossPage(io: Io, alloc: Alloc, bus: *Bus, meta: ConvMeta, conv_key: []
         "";
 
     for (meta.members) |uid| {
-        // notify — every member is pinged; the open-feed suppression is in
-        // notify.js (conv+session match), so the wire carries both fields.
-        var nj: std.ArrayList(u8) = .empty;
-        nj.print(alloc, "{{\"conv\":{f},\"session\":{f},\"text\":{f},\"link_url\":{f}}}", .{
-            std.json.fmt(conv_key, .{}), std.json.fmt(sid, .{}),
-            std.json.fmt(notify_text, .{}), std.json.fmt(rec_url, .{}),
-        }) catch {};
-        if (nj.items.len > 0) {
-            if (notifyBusKey(alloc, uid)) |k| bus.publish(k, nj.items) else |_| {}
+        // notify — every member EXCEPT the author is pinged. The favicon dot
+        // means "a partner did something"; you don't notify yourself about your
+        // own message (the author already sees the self-confirm via the main
+        // feed echo). Skipping the author here is the real invariant — the
+        // open-feed conv+session suppression in notify.js only covers the
+        // currently-viewed thread, so author-skip is what keeps the dot quiet
+        // when you send to a thread you're not actively staring at.
+        if (!std.mem.eql(u8, uid, from_id)) {
+            var nj: std.ArrayList(u8) = .empty;
+            nj.print(alloc, "{{\"conv\":{f},\"session\":{f},\"text\":{f},\"link_url\":{f}}}", .{
+                std.json.fmt(conv_key, .{}), std.json.fmt(sid, .{}),
+                std.json.fmt(notify_text, .{}), std.json.fmt(rec_url, .{}),
+            }) catch {};
+            if (nj.items.len > 0) {
+                if (notifyBusKey(alloc, uid)) |k| bus.publish(k, nj.items) else |_| {}
+            }
         }
 
         // sidebar — topic-added to every member on the first message only.
@@ -267,10 +285,12 @@ fn fanoutCrossPage(io: Io, alloc: Alloc, bus: *Bus, meta: ConvMeta, conv_key: []
             if (sidebarBusKey(alloc, uid)) |k| bus.publish(k, topic_added) else |_| {}
         }
 
-        // recent — every member sees the row (sender included).
+        // recent — every member sees the row (sender included). `who` renders
+        // "You" for the recipient who authored it; everyone else sees the name.
         const where = recentWhere(io, alloc, meta, conv_key, uid) catch "";
+        const who = if (std.mem.eql(u8, uid, from_id)) "You" else msg.from;
         var rj: std.ArrayList(u8) = .empty;
-        recent_feed.encodeChatEvent(&rj, alloc, msg.date, rec_url, sid, where, msg.from, excerpt) catch continue;
+        recent_feed.encodeChatEvent(&rj, alloc, msg.date, rec_url, who, where, sid, excerpt, meta.kind == .dm) catch continue;
         if (recentBusKey(alloc, uid)) |k| bus.publish(k, rj.items) else |_| {}
 
         // images — only when the message carried <img> tags.
@@ -305,8 +325,9 @@ fn fanoutCrossPage(io: Io, alloc: Alloc, bus: *Bus, meta: ConvMeta, conv_key: []
     }
 }
 
-/// recentWhere is the per-recipient muted-context label: a channel names itself
-/// ("in <name>"); a DM names the OTHER party ("with <name>").
+/// recentWhere is the per-recipient context label the What column reads as
+/// "message <where> (<topic>)": a channel names itself ("in <name>"); a DM names
+/// the OTHER party ("to <name>").
 fn recentWhere(io: Io, alloc: Alloc, meta: ConvMeta, conv_key: []const u8, viewer: []const u8) ![]const u8 {
     if (meta.kind == .channel) return std.fmt.allocPrint(alloc, "in {s}", .{conv_key});
     var other: []const u8 = "";
@@ -314,7 +335,7 @@ fn recentWhere(io: Io, alloc: Alloc, meta: ConvMeta, conv_key: []const u8, viewe
         if (!std.mem.eql(u8, m, viewer)) other = m;
     }
     const name = try users.getUserName(io, alloc, other);
-    return std.fmt.allocPrint(alloc, "with {s}", .{name});
+    return std.fmt.allocPrint(alloc, "to {s}", .{name});
 }
 
 /// busBlob is the internal fan-out payload — every field a stream needs to build
@@ -408,6 +429,51 @@ pub fn dmConvDir(alloc: Alloc, conv: []const u8) ![]u8 {
 /// channelConvDir is {chat_root}/channels/<name>.
 pub fn channelConvDir(alloc: Alloc, name: []const u8) ![]u8 {
     return std.fs.path.join(alloc, &.{ chat_root, "channels", name });
+}
+
+/// blogCommentDir is {chat_root}/blog-comments/<slug> — the comment thread for a
+/// blog post. `slug` is always a blog.zig-enumerated post slug ([a-z0-9-]), so it
+/// carries no traversal and never names a thread for a post that doesn't exist.
+pub fn blogCommentDir(alloc: Alloc, slug: []const u8) ![]u8 {
+    return std.fs.path.join(alloc, &.{ chat_root, "blog-comments", slug });
+}
+
+/// CommentTally aggregates one author's blog-comment footprint across every post
+/// thread. It's keyed by display name because that's the only per-comment identity
+/// on disk — the uid is never stamped on a message (only the thread's `.lastauthor`
+/// holds the most-recent one). For a name-only guest the typed name IS their
+/// identity, so name == account; for two guests who picked the same name the tally
+/// merges them (a rare, acceptable smudge for an at-a-glance admin stat).
+pub const CommentTally = struct { name: []const u8, count: i64, last: []const u8 };
+
+/// tallyBlogComments walks every {chat_root}/blog-comments/<slug> thread, decodes
+/// it, and returns one CommentTally per distinct author name. `last` is the newest
+/// comment's RFC3339 date (fixed-width UTC → lexicographic order is chronological).
+/// Missing root → empty. Strings alias the request allocator's decode buffers.
+pub fn tallyBlogComments(io: Io, alloc: Alloc) ![]CommentTally {
+    const root = try std.fs.path.join(alloc, &.{ chat_root, "blog-comments" });
+    var dir = Io.Dir.cwd().openDir(io, root, .{ .iterate = true }) catch return &.{};
+    defer dir.close(io);
+
+    var out: std.ArrayList(CommentTally) = .empty;
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .directory) continue;
+        const conv_dir = try std.fs.path.join(alloc, &.{ root, entry.name });
+        const raw = (try rawSession(io, alloc, conv_dir, "comments")) orelse continue;
+        for (try decodeChatFile(alloc, raw)) |m| {
+            var found = false;
+            for (out.items) |*t| {
+                if (!std.mem.eql(u8, t.name, m.from)) continue;
+                t.count += 1;
+                if (std.mem.order(u8, m.date, t.last) == .gt) t.last = m.date;
+                found = true;
+                break;
+            }
+            if (!found) try out.append(alloc, .{ .name = m.from, .count = 1, .last = m.date });
+        }
+    }
+    return out.toOwnedSlice(alloc);
 }
 
 /// sessionMdPath is {conv_dir}/sessions/<sid>.md.
@@ -559,6 +625,24 @@ pub fn validSessionID(sid: []const u8) bool {
     return true;
 }
 
+/// validMsgRefID matches `^[A-Za-z0-9-]+_[0-9]+$` — a session slug, an
+/// underscore, a decimal message index. The canonical message-ref id check,
+/// shared by the /chat/msg/<id> lookup and reading_list's saved-ref parse (and a
+/// path guard for the embedded sid). One home so the two can't drift.
+pub fn validMsgRefID(id: []const u8) bool {
+    const cut = std.mem.lastIndexOfScalar(u8, id, '_') orelse return false;
+    const left = id[0..cut];
+    const right = id[cut + 1 ..];
+    if (left.len == 0 or right.len == 0) return false;
+    for (left) |c| {
+        if (!isAlnum(c) and c != '-') return false;
+    }
+    for (right) |c| {
+        if (c < '0' or c > '9') return false;
+    }
+    return true;
+}
+
 /// validChannelName matches `^[A-Za-z][A-Za-z0-9-]{0,39}$`
 /// — a letter, then up to 39 of letter/digit/hyphen (1..40 chars total).
 pub fn validChannelName(name: []const u8) bool {
@@ -576,4 +660,48 @@ fn isAlpha(c: u8) bool {
 
 fn isAlnum(c: u8) bool {
     return isAlpha(c) or (c >= '0' and c <= '9');
+}
+
+const testing = std.testing;
+
+test "validMsgRefID: accepts slug_index, rejects everything off-shape" {
+    // canonical shapes (DM date-sid, channel word-sid, hyphenated sid)
+    try testing.expect(validMsgRefID("2026-05-28_5"));
+    try testing.expect(validMsgRefID("general1_3"));
+    try testing.expect(validMsgRefID("smoke-dm-topic_12"));
+    // off-shape: no underscore, empty halves, non-digit index, trailing junk
+    try testing.expect(!validMsgRefID("nodigits"));
+    try testing.expect(!validMsgRefID("yo_"));
+    try testing.expect(!validMsgRefID("_5"));
+    try testing.expect(!validMsgRefID("yo_5x"));
+    try testing.expect(!validMsgRefID("yo_5_"));
+    try testing.expect(!validMsgRefID(""));
+}
+
+test "fs: a posted message round-trips through the store (real Io over a temp dir)" {
+    // The shape lib/std uses to test its own file I/O (cf. the std.Io writer
+    // tests): hand the real code a real Io over a throwaway directory and assert
+    // on the bytes that come back. Ours mints its own Io.Threaded instead of
+    // borrowing std.testing.io — a reminder the io is just a value you can make.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    chat_root = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+
+    var threaded = std.Io.Threaded.init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var bus = Bus.init(io, a);
+
+    const dir = try dmConvDir(a, "1_2");
+    const meta = ConvMeta{ .kind = .dm, .members = &[_][]const u8{} };
+    _ = try appendMessage(io, a, &bus, meta, dir, "1_2", "topic", "Tester", "1", "hello world", "");
+
+    const msgs = try decodeChatFile(a, (try rawSession(io, a, dir, "topic")).?);
+    try testing.expectEqual(@as(usize, 1), msgs.len);
+    try testing.expectEqualStrings("Tester", msgs[0].from);
+    try testing.expectEqualStrings("hello world", msgs[0].markdown);
 }

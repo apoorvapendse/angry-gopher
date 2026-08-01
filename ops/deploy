@@ -37,20 +37,65 @@ git push
 COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)
 
 # Build the front-end bundles FIRST — build.zig embeds them (see build.zig).
-echo "Building Elm/TS + driving bundles..."
+echo "Building Elm + delivery bundles + the Safari + chess WASM cores..."
 "$GOPHER_DIR/ops/build_elm"
-"$GOPHER_DIR/ops/build_driving"
+"$GOPHER_DIR/ops/build_delivery"
+"$GOPHER_DIR/ops/build_safari_wasm"
+"$GOPHER_DIR/ops/build_chess_wasm"
 
-# ReleaseSafe: optimized, but keeps the runtime safety checks (bounds,
-# overflow, etc.) — the right trade for a small server where not crashing
-# into UB matters more than the last few percent of speed.
-echo "Building zig-server ($COMMIT, ReleaseSafe)..."
-( cd "$GOPHER_DIR/zig-server" && zig build -Doptimize=ReleaseSafe )
+# Build the native Linux Safari executable — a free-standing download (NOT embedded),
+# rsync'd to downloads/ below and served by downloads.zig ("Linux Executable" on the
+# home page). Built locally because it needs the X11 dev libs the droplet lacks.
+echo "Building the native Linux Safari executable (download)..."
+"$GOPHER_DIR/ops/build_safari_download"
+SAFARI_BIN="$GOPHER_DIR/games/driving/zig-out/bin/safari_x11"
+
+# Cross-build the Windows .scr screensaver — the other free-standing download offered
+# on the /safari_download page. Cross-compiled from this Linux box (no Windows SDK),
+# rsync'd to downloads/ below alongside the Linux binary.
+echo "Cross-building the Windows Safari .scr (download)..."
+"$GOPHER_DIR/ops/build_safari_windows"
+SAFARI_SCR="$GOPHER_DIR/games/driving/zig-out/bin/safari.scr"
+
+# Debug build (default optimize mode). The zig server is I/O-bound — it serves
+# embedded static JS, small files, and small markdown renders, with no hot
+# compute loop — so LLVM's optimization passes (~72s for ReleaseSafe vs ~7s for
+# Debug) buy ~nothing here. Debug also carries the FULL set of runtime safety
+# checks (a superset of ReleaseSafe's), and it's the exact mode `ops/start` runs
+# locally, so prod ships the build we dogfood every day. If a genuinely
+# CPU-bound path ever lands in the zig server, flip back to
+# `-Doptimize=ReleaseSafe` (or optimize just that path).
+echo "Building zig-server ($COMMIT, Debug)..."
+# -Dcommit bakes the short-hash into the binary so /version reports the exact
+# deployed commit (build.zig -> home.zig handleVersion -> watchdog-status.txt).
+( cd "$GOPHER_DIR/zig-server" && zig build "-Dcommit=$COMMIT" )
 BIN="$GOPHER_DIR/zig-server/zig-out/bin/zig-server"
 
-# The binary is self-contained + statically linked, so we ship exactly one file.
+# The binary is self-contained + statically linked. We also ship the blog posts:
+# they're free-standing content (markdown read at request time, NOT @embedFile'd),
+# so they ride alongside the binary rather than inside it. --delete is scoped to
+# blog/posts ONLY, so the repo is the single source of truth for what's live (a
+# post removed from git is removed from prod) and the blast radius never reaches
+# the data tree or ~/Auth. Posts sync BEFORE the restart so a brand-new post a new
+# route depends on is present when the fresh binary starts.
 echo "Syncing to $DEPLOY_HOST:$DEPLOY_DIR ..."
 rsync -avz "$BIN" "$DEPLOY_HOST:$DEPLOY_DIR/zig-server"
+rsync -avz --mkpath --delete "$GOPHER_DIR/blog/posts/" "$DEPLOY_HOST:$DEPLOY_DIR/blog/posts/"
+# Same deal for the pages/ tree (currently just steve-resume.md) — free-standing
+# markdown read at request time; --delete scoped to pages/ keeps the repo the
+# single source of truth for what's live.
+rsync -avz --mkpath --delete "$GOPHER_DIR/pages/" "$DEPLOY_HOST:$DEPLOY_DIR/pages/"
+# And the gallery/ images (the /gallery preview surface) — free-standing content
+# read at request time, same as above; --delete scoped to gallery/ keeps the repo
+# authoritative. /gallery is unlinked (hidden) but public, so this ships it live.
+rsync -avz --mkpath --delete "$GOPHER_DIR/gallery/" "$DEPLOY_HOST:$DEPLOY_DIR/gallery/"
+# And the native Safari download artifacts (built above) — free-standing downloads
+# served by downloads.zig. They're build artifacts (gitignored, not rsync'd from a
+# repo dir like the trees above), so ship the single files to downloads/; --mkpath
+# creates the dir on first deploy. The Linux binary and the Windows .scr both land
+# in downloads/ and back the two links on the /safari_download page.
+rsync -avz --mkpath "$SAFARI_BIN" "$DEPLOY_HOST:$DEPLOY_DIR/downloads/safari-linux"
+rsync -avz --mkpath "$SAFARI_SCR" "$DEPLOY_HOST:$DEPLOY_DIR/downloads/safari-windows.scr"
 
 echo "Restarting $DEPLOY_SERVICE ..."
 # Health check hits the REAL FRONT DOOR, not /driving. The first cutover went
@@ -58,10 +103,29 @@ echo "Restarting $DEPLOY_SERVICE ..."
 # — a logged-out visitor couldn't log in. /version proves the binary is the
 # fresh build; /login proves the front door a stranger actually lands on works.
 # (-f makes curl fail on a 4xx/5xx, so a 404 front door fails the deploy.)
-ssh "$DEPLOY_HOST" "sudo systemctl restart $DEPLOY_SERVICE && sleep 1 && \
+#
+# Poll /version (up to ~5s) instead of a fixed `sleep 1`: the server binds the
+# port in well under a second, so this returns as soon as it's actually up. If
+# it never comes up the loop just exhausts and the real checks below fail the
+# deploy.
+ssh "$DEPLOY_HOST" "sudo systemctl restart $DEPLOY_SERVICE && \
+    for _ in \$(seq 1 50); do curl -fsS http://localhost:9001/version >/dev/null 2>&1 && break; sleep 0.1; done && \
     systemctl is-active $DEPLOY_SERVICE && \
     curl -fsS http://localhost:9001/version >/dev/null && \
     curl -fsS http://localhost:9001/login >/dev/null && \
     echo 'zig front door serving on :9001 (/version + /login OK)'"
+
+# Refresh the watchdog too: ship the current deploy/watchdog.py (so the host copy
+# never drifts from the repo) and bounce it, so watchdog-status.txt picks up the
+# new commit hash + resets uptime right away instead of within a cycle. The
+# watchdog is monitoring aux, not the service — best-effort, so a hiccup here
+# WARNs but never fails an otherwise-green server deploy.
+echo "Refreshing watchdog ..."
+if scp "$GOPHER_DIR/deploy/watchdog.py" "$DEPLOY_HOST:~/watchdog.py" && \
+   ssh "$DEPLOY_HOST" "sudo systemctl restart watchdog && systemctl is-active watchdog"; then
+    echo "watchdog refreshed (latest watchdog.py, restarted)"
+else
+    echo "WARNING: watchdog refresh failed (server deploy is fine; fix the watchdog by hand)" >&2
+fi
 
 echo "Deploy complete: https://lynrummy.com/  (verify the real front door, not just /driving)"

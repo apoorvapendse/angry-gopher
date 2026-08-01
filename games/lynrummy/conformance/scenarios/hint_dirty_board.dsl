@@ -23,3 +23,234 @@ scenario triple_in_hand_with_dirty_board_returns_no_hint
   board:
     - 5♣ 6♣
   expect_steps:
+
+# --- loner flag: a hand-origin loner should be finished with BOARD cards
+#     first, not by projecting more hand cards. Real seed-42 game-2 mid-turn
+#     state (uid 16): the 2♠ we just laid onto an empty spot completes into a
+#     set of 2s using two board peels — no hand card needed. WITHOUT the loner
+#     flag the solver projects [8♥ 9♣] and bundles an unrelated 8-9-T run;
+#     WITH it, the hint is just the two board peels that finish the 2♠.
+
+# --- loner needs a hand PAIR: board-only fails, so the solver projects a
+#     pair and the loner is pulled onto it. Real Stephen2 game-5 state: T♠'
+#     laid onto an empty spot; no 8/9/J/Q or ten is extractable from the
+#     board without stranding cards, so no board-only finish exists. The
+#     pair [8♠' 9♥] lands and the T♠' completes it. The whole hint reads as
+#     ONE line (the pair-landing-pad compression).
+
+scenario loner_ts_completed_with_hand_pair
+  desc: T♠' was just placed from hand onto an empty spot (loner=true). Board-only fails; the solver projects the hand pair [8♠' 9♥] and pulls the T♠' onto it. Compresses to a single place-with line.
+  op: hint_for_hand
+  loner: true
+  hand: 4♥' 6♥' 9♥ 8♠' 9♠' J♠' A♦' 9♦' J♦' 3♣ 5♣ 6♣ J♣ Q♣
+  board:
+    - K♠ A♠ 2♠ 3♠
+    - T♦ J♦ Q♦ K♦
+    - 2♥ 3♥ 4♥
+    - 7♠ 7♦ 7♣
+    - A♣ A♦ A♥
+    - 2♣ 3♦ 4♣ 5♥ 6♠ 7♥
+    - T♠'
+  expect_steps:
+    - place 8♠ and 9♥ with the T♠ on the board
+
+# --- wholesale-merge pre-pass, trouble+trouble first: two trouble stacks
+#     that COMPLETE each other merge together before anything leans on a
+#     helper. Real Stephen2 game-5 state: after cannibalizing groups to
+#     build the ace set, [K♠ A♦] and [2♠] are left over — and they ARE the
+#     wrap run K♠ A♦ 2♠. Without this phase the pre-pass dragged each
+#     piece one-by-one onto the healthy [3♦ 4♣ 5♥ 6♠] run (two moves,
+#     touching structure the play never needed). Only COMPLETE results
+#     count: two loose cards never merge into a still-troublesome pair
+#     (they may have been split apart for good board-wide reasons).
+
+scenario loner_trouble_pair_and_singleton_complete_each_other
+  desc: trouble [K♠ A♦] + [2♠] snap together into the complete wrap run (loner=true). One free_pull, board clean; the healthy 3♦-6♠ run is never touched.
+  op: hint_for_hand
+  loner: true
+  hand: J♣
+  board:
+    - J♦ Q♦ K♦
+    - 2♥ 3♥ 4♥
+    - 7♠ 7♦ 7♣
+    - A♣ 2♣ 3♣
+    - 3♦ 4♣ 5♥ 6♠
+    - 6♣ 7♥ 8♠' 9♦'
+    - 9♥ T♠' J♦' Q♣
+    - 9♠' T♦ J♠'
+    - 3♠ 4♥' 5♣ 6♥'
+    - A♥ A♦' A♠
+    - K♠ A♦
+    - 2♠
+  expect_steps:
+    - pull 2♠ onto K♠ A♦
+
+# --- wholesale-merge pre-pass: a human looks for whole stacks that simply
+#     join BEFORE anything that merits the word "solve". Real Stephen2
+#     game-5 state: the trouble pair [8♠' 9♦'] extends the rb run
+#     [3♦ 4♣ 5♥ 6♠ 7♥] wholesale. The BFS solve instead returned the
+#     trouble-greedy peel (7♥ off the run onto the pair) — same plan
+#     length, but it shaves a healthy run and keeps the stack count,
+#     where the merge grows a 7-card run and drops a stack. With the
+#     loner flag set, the pre-pass finds the merge and never solves.
+
+scenario loner_pair_merges_wholesale_onto_run
+  desc: trouble pair [8♠' 9♦'] (built from a placed loner, loner=true) joins the rb run wholesale. The pre-pass hint is the single push; the solver's peel never surfaces.
+  op: hint_for_hand
+  loner: true
+  hand: A♦' 6♣ J♣
+  board:
+    - K♠ A♠ 2♠
+    - J♦ Q♦ K♦ A♦
+    - A♥ 2♥ 3♥ 4♥
+    - 7♠ 7♦ 7♣
+    - A♣ 2♣ 3♣
+    - 3♦ 4♣ 5♥ 6♠ 7♥
+    - 9♥ T♠' J♦' Q♣
+    - 9♠' T♦ J♠'
+    - 3♠ 4♥' 5♣ 6♥'
+    - 8♠' 9♦'
+  expect_steps:
+    - push 8♠ 9♦ onto 3♦ 4♣ 5♥ 6♠ 7♥
+
+# --- in-place fusion: the landing is mid-plan and a later board move
+#     consumes its RESULT. Real Stephen2 game-5 follow-on state: after the
+#     pair hint, the player moved the 8♠' to the board too — two loners
+#     (T♠', 8♠'). The solver lands 9♥ on the T♠', then pulls the 8♠' onto
+#     [9♥ T♠']. Floating that pull ahead of the landing (the old reorder)
+#     told the player to pull onto a group that didn't exist yet.
+
+scenario loner_ts_and_8s_hand_card_lands_mid_plan
+  desc: two loners T♠' and 8♠' (loner=true). Board-only fails; the solver projects 9♥, lands it on the T♠', then pulls the 8♠' onto the result. Solver order is kept - play from hand FIRST, then the dependent pull.
+  op: hint_for_hand
+  loner: true
+  hand: 4♥' 6♥' 9♥ 9♠' J♠' A♦' 9♦' J♦' 3♣ 5♣ 6♣ J♣ Q♣
+  board:
+    - K♠ A♠ 2♠ 3♠
+    - T♦ J♦ Q♦ K♦
+    - 2♥ 3♥ 4♥
+    - 7♠ 7♦ 7♣
+    - A♣ A♦ A♥
+    - 2♣ 3♦ 4♣ 5♥ 6♠ 7♥
+    - T♠'
+    - 8♠'
+  expect_steps:
+    - play 9♥ from hand onto T♠
+    - pull 8♠ onto 9♥ T♠
+
+scenario loner_2s_finished_with_board_cards
+  desc: 2♠ was just placed from hand onto an empty spot (loner=true). The board can be made fully legal by peeling 2♣ and 2♥ onto it (a set of 2s) — zero new hand cards. The hint is board-only; no "place from hand" line.
+  op: hint_for_hand
+  loner: true
+  hand: 8♥ 4♦ 8♦ 6♣' 9♣'
+  board:
+    - K♠ A♠ 2♠
+    - T♦ J♦ Q♦ K♦
+    - 2♥ 3♥ 4♥ 5♥'
+    - 7♠ 7♦ 7♣
+    - A♣ A♦ A♥ A♠'
+    - 2♣ 3♦ 4♣ 5♥ 6♠'
+    - 5♦' 6♠ 7♥
+    - T♠' J♥' Q♠
+    - 2♥' 3♠ 4♥'
+    - 2♠'
+  expect_steps:
+    - peel 2♣ from 2♣ 3♦ 4♣ 5♥ 6♠ onto 2♠
+    - peel 2♥ from 2♥ 3♥ 4♥ 5♥ onto 2♣ 2♠
+
+# --- shift humanization: a board-only plan whose second move is a shift.
+#     Real Stephen2 game-5 state: T♥' just placed as a loner (loner=true).
+#     The solve peels 9♥ onto it, then shifts 5♠ into 6♦' 7♠' 8♥ so the
+#     8♥ can pop off and complete [8♥ 9♥ T♥']. Before the shift verb was
+#     humanized, the all-or-nothing guardrail returned the ENTIRE hint in
+#     engine-speak — including the peel line we already knew how to render.
+
+scenario loner_th_peel_then_shift_frees_the_eight
+  desc: board-only two-step plan for the T♥' loner - peel 9♥ onto it, then the compound shift line (backfill 5♠, freeing the 8♥). Both lines human.
+  op: hint_for_hand
+  loner: true
+  hand: Q♥ K♣ J♥
+  board:
+    - 7♠ 7♦ 7♣
+    - 8♣' 9♦ T♣
+    - A♥ A♦' A♣
+    - T♥ J♣ Q♦
+    - K♥' K♦ K♠
+    - 4♥ 5♥ 6♥
+    - 9♥ T♠' J♦ Q♠
+    - A♣' 2♣ 3♣ 4♣
+    - Q♣ K♥ A♠' 2♦' 3♣' 4♦ 5♠
+    - J♣' J♦' J♠'
+    - Q♣' K♦' A♠ 2♥
+    - A♥' 2♠' 3♦ 4♠' 5♦' 6♠'
+    - 9♥' 9♣ 9♠
+    - 3♦' 4♣' 5♥' 6♣ 7♥ 8♠' 9♦' T♠
+    - 8♦ 9♠' T♦
+    - 6♥' 6♠ 6♣'
+    - 6♦' 7♠' 8♥
+    - A♦ 2♠ 3♥ 4♠ 5♦
+    - 2♥' 3♠ 4♥' 5♣
+    - T♥'
+  expect_steps:
+    - peel 9♥ from 9♥ T♠ J♦ Q♠ onto T♥
+    - shift 5♠ into 6♦ 7♠ 8♥, freeing the 8♥ onto 9♥ T♥
+
+# --- seed-build collapse with a side repair. Real Stephen2 game-5 state:
+#     one card left in hand (T♦'). The solve seeds the tens set with it,
+#     steals the T♣ (spawning [8♣' 9♦]), repairs the spawn onto the T♠'
+#     run, and peels the T♠ to complete [T♣ T♦' T♠]. The side repair used
+#     to block the seed collapse — the player saw four raw engine lines.
+#     One line now; placing the seed sets the loner flag, so subsequent
+#     Hint presses walk the board-only cleanup.
+
+scenario last_card_seeds_tens_set_despite_spawn_repair
+  desc: hand is just T♦' (loner=false - last action merged a hand card onto a run). Four-move plan collapses to the one seed line.
+  op: hint_for_hand
+  loner: false
+  hand: T♦'
+  board:
+    - 7♠ 7♦ 7♣
+    - 8♣' 9♦ T♣
+    - A♥ A♦' A♣
+    - T♥ J♣ Q♦
+    - K♥' K♦ K♠
+    - 4♥ 5♥ 6♥
+    - A♣' 2♣ 3♣ 4♣
+    - J♣' J♦' J♠'
+    - Q♣' K♦' A♠ 2♥
+    - A♥' 2♠' 3♦ 4♠' 5♦' 6♠'
+    - 9♥' 9♣ 9♠
+    - 3♦' 4♣' 5♥' 6♣ 7♥ 8♠' 9♦' T♠
+    - 8♦ 9♠' T♦
+    - 6♥' 6♠ 6♣'
+    - A♦ 2♠ 3♥ 4♠ 5♦
+    - 2♥' 3♠ 4♥' 5♣
+    - T♠' J♦ Q♠
+    - 8♥ 9♥ T♥'
+    - Q♣ K♥ A♠' 2♦' 3♣' 4♦ 5♠ 6♦' 7♠' 8♥'
+  expect_steps:
+    - place T♦ on board to build T♣ T♦ T♠
+
+# --- seed-build chain grown by a shift. Real Stephen2 game-6 state: the
+#     projected 6♦ seeds a diamond run; the first grower is a SHIFT (4♠
+#     backfills the spade run so [5♦' 6♠] can donate the 7♦'), then a peel
+#     completes [6♦ 7♦' 8♦]. The chain-follow treats every landing verb
+#     alike, so the shift advances the chain just as an absorb does.
+
+scenario seed_grown_by_shift_then_peel
+  desc: hand has 6♦ among others (loner=false). The three-move plan collapses to the one seed line naming the run it builds.
+  op: hint_for_hand
+  loner: false
+  hand: Q♥ 9♠ J♠ 2♦' 6♦ T♣' J♣
+  board:
+    - 2♥ 3♥ 4♥
+    - K♥' K♦ K♠
+    - 5♦' 6♠ 7♦'
+    - A♣ A♦ A♥ A♠'
+    - A♠ 2♠ 3♠ 4♠
+    - 8♦ 9♦' T♦ J♦ Q♦
+    - 7♠ 7♦ 7♣
+    - 2♣ 3♦ 4♣
+    - 5♥ 6♥' 7♥
+  expect_steps:
+    - place 6♦ on board to build 6♦ 7♦ 8♦

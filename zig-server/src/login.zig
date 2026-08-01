@@ -3,9 +3,11 @@
 //! name):
 //!   /login       — guests: pick a non-reserved name; a fresh login allocates a
 //!                  new user id. Plays Lyn Rummy, no chat.
-//!   /login/full  — members: name + password. An existing member name verifies;
-//!                  a new name registers (password twice) and reserves the name.
-//!                  Members get a signed session cookie.
+//!   /login/full  — the chat password gate (members get a signed session cookie).
+//!                  A stranger types a name and picks Log in or Create account; a
+//!                  cookied guest upgrades in place (name locked); an existing
+//!                  member name verifies. A show/hide eyeball replaces a confirm
+//!                  field. See PwMode.
 //!   /logout      — clears the cookies; "release" also deletes the user's data.
 //!
 //! This is the last piece the resolution port (users.zig) deliberately left for
@@ -21,7 +23,9 @@ const http = @import("http.zig");
 const users = @import("users.zig");
 const storage = @import("storage.zig");
 const chat = @import("chat.zig");
+const html = @import("html.zig");
 const store = @import("chat_store.zig");
+const chat_state = @import("chat_state.zig");
 const Bus = @import("bus.zig").Bus;
 
 const Alloc = std.mem.Allocator;
@@ -75,61 +79,109 @@ fn handleLogin(req: *Request, io: Io, alloc: Alloc) !void {
 
 // ── /login/full (member tier) ─────────────────────────────────────────────────
 
-/// handleLoginFull is the password gate. The name is fixed to the identity you
-/// already have (a guest name, or an explicit ?name= from the reserved-name
-/// notice). A returning member verifies a password; a guest registers by entering
-/// one twice. On success it issues a member session and returns to `next`.
+/// The three shapes of the password page, selected by who's asking:
+///   stranger     — no identity: editable name + Log in / Create account buttons
+///                  (we don't guess returning-vs-new; the button is the intent).
+///   upgrade      — a cookied guest: name LOCKED (it's theirs, and /login never
+///                  hands a guest a member's name, so upgrade-in-place is safe);
+///                  set a password to become a member.
+///   member_login — an existing member name (already a member, or an explicit
+///                  ?name= from the reserved-name notice): name LOCKED, verify.
+const PwMode = enum { stranger, upgrade, member_login };
+
+/// handleLoginFull is the password gate for chat. It never bounces to /login to
+/// collect a name: a stranger types one here (and chooses Log in or Create
+/// account), a cookied guest upgrades in place with the name locked, and an
+/// existing-member name verifies. On success it issues a member session and
+/// returns to `next`.
 fn handleLoginFull(req: *Request, io: Io, alloc: Alloc, bus: *Bus) !void {
     // Resolve header-derived state BEFORE touching the body: iterateHeaders
     // asserts on received_head, and the body read invalidates header/target
     // strings — so resolve identity and dup the query target up front.
     const cur = try users.currentUser(io, alloc, req);
-    const target = try alloc.dupe(u8, req.head.target);
+    const target = try http.target(req, alloc);
     var body: []const u8 = "";
     if (req.head.method == .POST) {
         body = (try http.readLimitedBody(req, alloc, 64 * 1024)) orelse return;
     }
     const next = sanitizeNext((try formValue(alloc, target, body, "next")) orelse "");
+    const has_identity = cur.id.len != 0;
 
-    // The name is fixed: an explicit name (reserved-name notice) wins, else the
-    // current guest's name. With no usable name, identify first.
-    var raw = try users.sanitizeUser(alloc, (try formValue(alloc, target, body, "name")) orelse "");
-    if (raw.len == 0) {
-        raw = cur.name;
+    // Pick the mode + the page name, in precedence order:
+    //   1. an explicit name that's already a member ("log in as them") wins even
+    //      over a cookie — this is the reserved-name notice's /login/full?name=X
+    //      link. Suppressed when the stranger form's button says "register" (then
+    //      a taken name should error in stranger mode, not flip to login).
+    //   2. else, with an identity, the name is the cookie's (locked, so we ignore
+    //      any posted name): a member re-verifies, a guest upgrades in place.
+    //   3. else a free-choosing stranger (editable name, Log in / Create account).
+    const explicit = try users.sanitizeUser(alloc, (try formValue(alloc, target, body, "name")) orelse "");
+    const wants_register = std.mem.eql(u8, (try formValue(alloc, target, body, "action")) orelse "", "register");
+    const explicit_member = explicit.len != 0 and (try users.findMemberByName(io, alloc, explicit)) != null;
+
+    var mode: PwMode = undefined;
+    var name: []const u8 = "";
+    if (explicit_member and !wants_register) {
+        name = explicit;
+        mode = .member_login;
+    } else if (has_identity) {
+        name = cur.name;
+        mode = if (cur.member) .member_login else .upgrade;
+    } else {
+        name = explicit;
+        mode = .stranger;
     }
-    const vr = try users.validateUserName(alloc, raw);
-    if (vr.err.len != 0) return sendRedirect(req, alloc, "/login", &.{});
-    const name = vr.name;
-
-    const member_id = try users.findMemberByName(io, alloc, name);
-    const is_member = member_id != null;
 
     if (req.head.method != .POST) {
-        if (is_member) return renderFullLoginPage(req, alloc, name, next, "");
-        return renderRegisterPage(req, alloc, name, next, "");
+        return renderPwPage(req, alloc, mode, name, next, "");
     }
 
     const password = (try chat.formField(alloc, body, "password")) orelse "";
-    if (is_member) {
-        // Returning member — verify their password.
-        if (!users.checkUserPassword(io, alloc, member_id.?, password)) {
-            const msg = try std.fmt.allocPrint(alloc, "Wrong password for \u{201C}{s}\u{201D}.", .{name});
-            return renderFullLoginPage(req, alloc, name, next, msg);
-        }
-        return loginAsMember(req, io, alloc, member_id.?, next);
-    }
 
-    // Registration — the same password in both boxes, on one screen.
-    if (password.len == 0) return renderRegisterPage(req, alloc, name, next, "Please enter a password.");
-    const confirm = (try chat.formField(alloc, body, "confirm")) orelse "";
-    if (!std.mem.eql(u8, password, confirm)) {
-        return renderRegisterPage(req, alloc, name, next, "The two passwords don't match — please re-enter them.");
+    switch (mode) {
+        .member_login => {
+            // Verify against the existing member of this (locked) name.
+            const member_id = try users.findMemberByName(io, alloc, name);
+            if (member_id == null) {
+                // The name lost its member between GET and POST, or a stranger
+                // typed a non-member and clicked Log in — offer to register.
+                return renderPwPage(req, alloc, .stranger, name, next, try std.fmt.allocPrint(alloc, "No account named \u{201C}{s}\u{201D}. Create one instead?", .{name}));
+            }
+            if (!users.checkUserPassword(io, alloc, member_id.?, password)) {
+                return renderPwPage(req, alloc, mode, name, next, try std.fmt.allocPrint(alloc, "Wrong password for \u{201C}{s}\u{201D}.", .{name}));
+            }
+            return loginAsMember(req, io, alloc, member_id.?, next);
+        },
+        .upgrade => {
+            // Cookied guest → member, in place (registerMember keeps cur.id).
+            if (password.len == 0) return renderPwPage(req, alloc, mode, name, next, "Please enter a password.");
+            const id = try registerMember(cur, io, alloc, name, password);
+            publishUserArrived(io, alloc, bus, id, name);
+            sendHostWelcome(io, alloc, bus, id);
+            return loginAsMember(req, io, alloc, id, next);
+        },
+        .stranger => {
+            const vr = try users.validateUserName(alloc, name);
+            if (vr.err.len != 0) return renderPwPage(req, alloc, .stranger, name, next, vr.err);
+            const valid = vr.name;
+            const member_id = try users.findMemberByName(io, alloc, valid);
+            const action = (try chat.formField(alloc, body, "action")) orelse "";
+            if (std.mem.eql(u8, action, "login")) {
+                if (member_id == null) return renderPwPage(req, alloc, .stranger, valid, next, try std.fmt.allocPrint(alloc, "No account named \u{201C}{s}\u{201D}. Create one instead?", .{valid}));
+                if (!users.checkUserPassword(io, alloc, member_id.?, password)) {
+                    return renderPwPage(req, alloc, .stranger, valid, next, try std.fmt.allocPrint(alloc, "Wrong password for \u{201C}{s}\u{201D}.", .{valid}));
+                }
+                return loginAsMember(req, io, alloc, member_id.?, next);
+            }
+            // Create account.
+            if (member_id != null) return renderPwPage(req, alloc, .stranger, valid, next, try std.fmt.allocPrint(alloc, "\u{201C}{s}\u{201D} is taken — log in instead.", .{valid}));
+            if (password.len == 0) return renderPwPage(req, alloc, .stranger, valid, next, "Please enter a password.");
+            const id = try registerMember(cur, io, alloc, valid, password);
+            publishUserArrived(io, alloc, bus, id, valid);
+            sendHostWelcome(io, alloc, bus, id);
+            return loginAsMember(req, io, alloc, id, next);
+        },
     }
-    const id = try registerMember(cur, io, alloc, name, password);
-    // Tell subscribers (chat's sidebar SSE) a new authorized principal exists —
-    // they weren't a chat partner before and are one now.
-    publishUserArrived(io, alloc, bus, id, name);
-    return loginAsMember(req, io, alloc, id, next);
 }
 
 /// registerMember turns `name` into a password member and returns its id. If the
@@ -178,7 +230,7 @@ pub fn handleLogout(req: *Request, io: Io, alloc: Alloc) !void {
         }
         return renderLogoutComplete(req, alloc);
     }
-    if (user.id.len == 0) return sendRedirect(req, alloc, "/login", &.{});
+    if (user.id.len == 0) return sendRedirect(req, alloc, "/", &.{});
     return renderLogoutPage(req, alloc, user.name);
 }
 
@@ -202,10 +254,53 @@ fn publishUserArrived(io: Io, alloc: Alloc, bus: *Bus, new_uid: []const u8, new_
     }
 }
 
+/// host_uid is uid=1 — the site's host (Steve on prod). New members get an
+/// automated welcome DM from this account so their Chat opens on a real
+/// conversation and they know a human will reply. The display name is looked up,
+/// not hard-coded.
+const host_uid = "1";
+
+/// sendHostWelcome seeds a "general" DM topic from the host to a freshly
+/// registered member with an automated hello, and points the new member's /chat
+/// resume bookmark at it (they have none yet, so /chat would otherwise show the
+/// empty state). No-op when the new member IS the host, when there's no host
+/// account, or when the host↔member DM already has a topic — so it's idempotent
+/// across re-registration. Best-effort: a failure just means no welcome, never a
+/// broken signup.
+fn sendHostWelcome(io: Io, alloc: Alloc, bus: *Bus, new_uid: []const u8) void {
+    sendHostWelcomeImpl(io, alloc, bus, new_uid) catch {};
+}
+
+fn sendHostWelcomeImpl(io: Io, alloc: Alloc, bus: *Bus, new_uid: []const u8) !void {
+    if (std.mem.eql(u8, new_uid, host_uid)) return;
+    if (!users.principalExists(io, alloc, host_uid)) return;
+
+    const host_name = try users.getUserName(io, alloc, host_uid);
+    const pair = try store.chatPairKey(alloc, host_uid, new_uid);
+    const dir = try store.dmConvDir(alloc, pair);
+
+    // Idempotent: only seed when this DM has no topics yet.
+    if ((try store.defaultSession(io, alloc, dir)).len != 0) return;
+
+    const members = try alloc.alloc([]const u8, 2);
+    members[0] = host_uid;
+    members[1] = new_uid;
+    const meta = store.ConvMeta{ .kind = .dm, .members = members };
+
+    const topic = "general";
+    const msg = try std.fmt.allocPrint(alloc, "Hi, this is an automated message from {s}. Please say hello and {s} will get back to you soon.", .{ host_name, host_name });
+    _ = try store.appendMessage(io, alloc, bus, meta, dir, pair, topic, host_name, host_uid, msg, "");
+
+    // The new member has no last-conv bookmark yet — land their /chat here.
+    chat_state.setUserLastSession(io, alloc, new_uid, pair, topic);
+}
+
 // ── cookies + response helpers ────────────────────────────────────────────────
 
-/// uidCookie is the long-lived identity cookie (the user id).
-fn uidCookie(alloc: Alloc, id: []const u8) ![]const u8 {
+/// uidCookie is the long-lived identity cookie (the user id). Public so the blog
+/// comment path can mint a name-only guest inline (the same guest issuance this
+/// file does at /login) and set its identity cookie on the redirect back.
+pub fn uidCookie(alloc: Alloc, id: []const u8) ![]const u8 {
     return std.fmt.allocPrint(alloc, "gopher_uid={s}; Path=/; Max-Age={d}; HttpOnly; SameSite=Lax", .{ id, uid_max_age });
 }
 
@@ -257,10 +352,10 @@ fn renderLoginPage(req: *Request, alloc: Alloc, current: []const u8, err_msg: []
     var b: std.ArrayList(u8) = .empty;
     try b.appendSlice(alloc, login_page_head);
     if (current.len != 0) {
-        try b.print(alloc, "<p class=\"muted\">Currently playing as <strong>{s}</strong>.</p>", .{try chat.htmlEscape(alloc, current)});
+        try b.print(alloc, "<p class=\"muted\">Currently playing as <strong>{s}</strong>.</p>", .{try html.htmlEscape(alloc, current)});
     }
     if (err_msg.len != 0) {
-        try b.print(alloc, "<p class=\"err\">{s}</p>", .{try chat.htmlEscape(alloc, err_msg)});
+        try b.print(alloc, "<p class=\"err\">{s}</p>", .{try html.htmlEscape(alloc, err_msg)});
     }
     try b.appendSlice(alloc, login_page_tail);
     try sendHTML(req, alloc, b.items, &.{});
@@ -269,7 +364,7 @@ fn renderLoginPage(req: *Request, alloc: Alloc, current: []const u8, err_msg: []
 /// renderReservedNotice tells a guest a name belongs to a member, offering the
 /// password login or a different name.
 fn renderReservedNotice(req: *Request, alloc: Alloc, name: []const u8) !void {
-    const esc = try chat.htmlEscape(alloc, name);
+    const esc = try html.htmlEscape(alloc, name);
     var b: std.ArrayList(u8) = .empty;
     try b.print(alloc,
         \\<!DOCTYPE html>
@@ -292,65 +387,86 @@ fn renderReservedNotice(req: *Request, alloc: Alloc, name: []const u8) !void {
     try sendHTML(req, alloc, b.items, &.{});
 }
 
-/// renderFullLoginPage: the returning-member screen (fixed name, one password).
-fn renderFullLoginPage(req: *Request, alloc: Alloc, name: []const u8, next: []const u8, err_msg: []const u8) !void {
-    const en = try chat.htmlEscape(alloc, name);
-    const enx = try chat.htmlEscape(alloc, next);
-    const err_line = if (err_msg.len == 0) "" else try std.fmt.allocPrint(alloc, "<p class=\"err\">{s}</p>", .{try chat.htmlEscape(alloc, err_msg)});
+/// renderPwPage renders the chat password screen in one of three modes (see
+/// PwMode). The name is an editable field for a stranger and a locked
+/// display + hidden input otherwise; the password box carries a show/hide
+/// eyeball (typo guard, no confirm field). `next` rides through as a hidden
+/// field so we return where the user was headed.
+fn renderPwPage(req: *Request, alloc: Alloc, mode: PwMode, name: []const u8, next: []const u8, err_msg: []const u8) !void {
+    const en = try html.htmlEscape(alloc, name);
+    const enx = try html.htmlEscape(alloc, next);
     var b: std.ArrayList(u8) = .empty;
-    try b.print(alloc,
-        \\<!DOCTYPE html>
-        \\<html><head><meta charset="utf-8"><title>♦️ Lyn Rummy ♥️</title>
-        \\{s}</head><body>
-        \\<h1>Log in to chat</h1>
-        \\<p class="muted">Enter the password for this name.</p>
-        \\<div class="name">{s}</div>
-        \\{s}
-        \\<form method="post" action="/login/full">
-        \\  <input type="hidden" name="name" value="{s}">
-        \\  <input type="hidden" name="next" value="{s}">
-        \\  <label>Password</label>
-        \\  <input name="password" type="password" autofocus>
-        \\  <button type="submit">Log in</button>
-        \\</form>
-        \\<p class="muted" style="margin-top:16px"><a href="/login">← Use a different name</a></p>
-        \\</body></html>
-    , .{ login_full_css, en, err_line, en, enx });
-    try sendHTML(req, alloc, b.items, &.{});
-}
 
-/// renderRegisterPage: the guest→member screen (fixed name, password twice).
-fn renderRegisterPage(req: *Request, alloc: Alloc, name: []const u8, next: []const u8, err_msg: []const u8) !void {
-    const en = try chat.htmlEscape(alloc, name);
-    const enx = try chat.htmlEscape(alloc, next);
-    const err_line = if (err_msg.len == 0) "" else try std.fmt.allocPrint(alloc, "<p class=\"err\">{s}</p>", .{try chat.htmlEscape(alloc, err_msg)});
-    var b: std.ArrayList(u8) = .empty;
     try b.print(alloc,
         \\<!DOCTYPE html>
         \\<html><head><meta charset="utf-8"><title>♦️ Lyn Rummy ♥️</title>
         \\{s}</head><body>
-        \\<h1>Complete registration with password</h1>
-        \\<p class="muted">Chat needs a password. This reserves your name so only you can use it.</p>
-        \\<div class="name">{s}</div>
-        \\{s}
-        \\<form method="post" action="/login/full">
-        \\  <input type="hidden" name="name" value="{s}">
-        \\  <input type="hidden" name="next" value="{s}">
-        \\  <label>Password</label>
-        \\  <input name="password" type="password" autofocus>
-        \\  <label>Confirm password</label>
-        \\  <input name="confirm" type="password">
-        \\  <button type="submit">Complete registration</button>
-        \\</form>
-        \\<p class="muted" style="margin-top:16px"><a href="/">← Back</a> · Just want to play? <a href="/login">Play as a guest</a></p>
-        \\</body></html>
-    , .{ login_full_css, en, err_line, en, enx });
+    , .{login_full_css});
+
+    // Heading + hint per mode.
+    switch (mode) {
+        .stranger => try b.appendSlice(alloc,
+            \\<h1>Log in or create an account</h1>
+            \\<p class="muted">Chat needs a password. Log in if you already have an account, or create one — your name is yours alone.</p>
+        ),
+        .upgrade => try b.appendSlice(alloc,
+            \\<h1>Set a password to use chat</h1>
+            \\<p class="muted">This keeps your name and game history, and unlocks chat. Pick a password.</p>
+        ),
+        .member_login => try b.appendSlice(alloc,
+            \\<h1>Log in to chat</h1>
+            \\<p class="muted">Enter the password for this name.</p>
+        ),
+    }
+
+    if (err_msg.len != 0) {
+        try b.print(alloc, "<p class=\"err\">{s}</p>", .{try html.htmlEscape(alloc, err_msg)});
+    }
+
+    try b.print(alloc, "<form method=\"post\" action=\"/login/full\"><input type=\"hidden\" name=\"next\" value=\"{s}\">", .{enx});
+
+    // Name: editable for a stranger, locked (display + hidden field) otherwise.
+    if (mode == .stranger) {
+        try b.print(alloc, "<label>Name</label><input name=\"name\" type=\"text\" value=\"{s}\" maxlength=\"40\" autocomplete=\"off\" autofocus>", .{en});
+    } else {
+        try b.print(alloc, "<div class=\"name\">{s}</div><input type=\"hidden\" name=\"name\" value=\"{s}\">", .{ en, en });
+    }
+
+    // Password + eyeball. Autofocus the password when the name is locked.
+    const pw_autofocus = if (mode == .stranger) "" else " autofocus";
+    try b.print(alloc,
+        \\<label>Password</label>
+        \\<div class="pw-row"><input id="pw" name="password" type="password"{s}>
+        \\<button type="button" class="pw-toggle" aria-label="Show password">👁</button></div>
+    , .{pw_autofocus});
+
+    // Buttons: two for a stranger (the chosen one is the intent), one otherwise.
+    switch (mode) {
+        .stranger => try b.appendSlice(alloc,
+            \\<div class="btn-row"><button type="submit" name="action" value="login">Log in</button>
+            \\<button type="submit" name="action" value="register" class="secondary">Create account</button></div>
+        ),
+        .upgrade => try b.appendSlice(alloc, "<button type=\"submit\" name=\"action\" value=\"register\">Create account</button>"),
+        .member_login => try b.appendSlice(alloc, "<button type=\"submit\" name=\"action\" value=\"login\">Log in</button>"),
+    }
+    try b.appendSlice(alloc, "</form>");
+
+    // Footer: a stranger / reserved-name visitor can drop to the no-password
+    // game; the cookied upgrader just steps back.
+    switch (mode) {
+        .stranger => try b.appendSlice(alloc, "<p class=\"muted\" style=\"margin-top:16px\">Just want to play Lyn Rummy? <a href=\"/login\">No password needed →</a></p>"),
+        .member_login => try b.appendSlice(alloc, "<p class=\"muted\" style=\"margin-top:16px\"><a href=\"/login\">← Pick a different name</a></p>"),
+        .upgrade => try b.appendSlice(alloc, "<p class=\"muted\" style=\"margin-top:16px\"><a href=\"/\">← Back</a></p>"),
+    }
+
+    try b.appendSlice(alloc, pw_toggle_script);
+    try b.appendSlice(alloc, "</body></html>");
     try sendHTML(req, alloc, b.items, &.{});
 }
 
 /// renderLogoutPage shows the logout confirmation with the release checkbox.
 fn renderLogoutPage(req: *Request, alloc: Alloc, user: []const u8) !void {
-    const esc = try chat.htmlEscape(alloc, user);
+    const esc = try html.htmlEscape(alloc, user);
     var b: std.ArrayList(u8) = .empty;
     try b.print(alloc,
         \\<!DOCTYPE html>
@@ -384,11 +500,13 @@ fn renderLogoutPage(req: *Request, alloc: Alloc, user: []const u8) !void {
 /// renderLogoutComplete clears the localStorage name prefill and sends the player
 /// to /login. The clear-cookie headers ride on THIS response.
 fn renderLogoutComplete(req: *Request, alloc: Alloc) !void {
+    // Home: a logged-out visitor picks where to go next (Driving is public, plus
+    // Lyn Rummy and chat).
     const body =
         \\<!doctype html><meta charset="utf-8">
         \\<script>
         \\  localStorage.removeItem('gopher_user');
-        \\  location.replace('/login');
+        \\  location.replace('/');
         \\</script>
     ;
     try sendHTML(req, alloc, body, &.{ clear_uid_cookie, clear_auth_cookie });
@@ -403,11 +521,37 @@ const login_full_css =
     \\.err { color: #b00020; font-size: 14px; }
     \\.name { font-size: 18px; font-weight: bold; color: #000080; margin: 12px 0 4px; }
     \\label { display: block; font-size: 13px; color: #444; margin-top: 10px; }
-    \\input[type=password] { font-size: 16px; padding: 8px; width: 100%; box-sizing: border-box; margin: 4px 0; }
+    \\input[type=password], input[type=text] { font-size: 16px; padding: 8px; width: 100%; box-sizing: border-box; margin: 4px 0; }
     \\button { background: #000080; color: white; border: none; padding: 10px 20px;
     \\         font-size: 15px; border-radius: 4px; cursor: pointer; margin-top: 12px; }
     \\a { color: #000080; }
+    \\.pw-row { position: relative; }
+    \\.pw-row input { padding-right: 46px; }
+    \\.pw-toggle { position: absolute; right: 2px; top: 4px; margin: 0; padding: 6px 8px;
+    \\             background: none; border: none; font-size: 17px; line-height: 1; cursor: pointer; }
+    \\.btn-row { display: flex; gap: 8px; }
+    \\.btn-row button { flex: 1; }
+    \\button.secondary { background: #fff; color: #000080; border: 1px solid #000080; }
     \\</style>
+;
+
+// pw_toggle_script: the show/hide eyeball for the password box. A typo guard
+// without a confirm field — the user can reveal what they typed. Self-contained,
+// inline (these standalone pre-chat pages aren't part of the chat JS substrate).
+const pw_toggle_script =
+    \\<script>
+    \\(function(){
+    \\  var btn=document.querySelector('.pw-toggle'), inp=document.getElementById('pw');
+    \\  if(!btn||!inp) return;
+    \\  btn.addEventListener('click', function(){
+    \\    var reveal = inp.type === 'password';
+    \\    inp.type = reveal ? 'text' : 'password';
+    \\    btn.textContent = reveal ? '🙈' : '👁';
+    \\    btn.setAttribute('aria-label', reveal ? 'Hide password' : 'Show password');
+    \\    inp.focus();
+    \\  });
+    \\})();
+    \\</script>
 ;
 
 // login_page_head / login_page_tail bracket the guest-login page's two optional

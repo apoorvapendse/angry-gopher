@@ -6,12 +6,13 @@
 //! thread pool (a never-awaited Io.Group + group.concurrent — see main). The
 //! pool grows on demand and finished tasks self-reap, so it's effectively
 //! goroutine-per-connection. This is the model chat needs (long-lived SSE
-//! streams that mustn't starve other connections), proven first by the /spike
-//! surface (spike.zig + bus.zig) before any chat handler is ported. Each
-//! connection still serves ONE request then closes (keep-alive off) — that's
+//! streams that mustn't starve other connections); bus.zig is the keyed
+//! fan-out runtime those streams run on. Each connection still serves ONE
+//! request then closes (keep-alive off) — that's
 //! independent of concurrency and can be revisited when chat lands.
 //!
-//! Run:  ops/build_driving && ops/build_elm   (from repo root, for the bundles)
+//! Run:  ops/build_elm && ops/build_safari_wasm && ops/build_delivery
+//!         (from the repo root, for the embedded bundles)
 //!       cd zig-server && zig build run        (serves on http://localhost:9001)
 
 const std = @import("std");
@@ -20,24 +21,45 @@ const net = std.Io.net;
 const http = @import("http.zig");
 const config = @import("config.zig");
 const driving = @import("driving.zig");
+const delivery = @import("delivery.zig");
+const chess = @import("chess.zig");
 const puzzles = @import("puzzles.zig");
 const game = @import("game.zig");
-const spike = @import("spike.zig");
 const chat = @import("chat.zig");
 const settings = @import("settings.zig");
 const learn = @import("learn.zig");
+const tutorial = @import("tutorial.zig");
 const admin = @import("admin.zig");
 const home = @import("home.zig");
+const blog = @import("blog.zig");
+const gallery = @import("gallery.zig");
+const downloads = @import("downloads.zig");
+const resume_page = @import("resume_page.zig");
+const safari_download = @import("safari_download.zig");
 const login = @import("login.zig");
 const brand = @import("brand.zig");
 const edge = @import("edge.zig");
 const users = @import("users.zig");
+const mem_meter = @import("mem_meter.zig");
 const Bus = @import("bus.zig").Bus;
 
-const PORT: u16 = 9001;
+const default_port: u16 = 9001;
+
+/// portFromEnv reads GOPHER_PORT (default 9001). A port override is load-bearing
+/// for running more than one server at once — e.g. the stress harness spins a
+/// hermetic sandbox instance on a side port so the :9001 dev server keeps running.
+fn portFromEnv(env: std.process.Environ.Map) u16 {
+    const s = env.get("GOPHER_PORT") orelse return default_port;
+    return std.fmt.parseInt(u16, std.mem.trim(u8, s, " \t\r\n"), 10) catch default_port;
+}
 
 pub fn main(init: std.process.Init.Minimal) !void {
-    const alloc = std.heap.page_allocator;
+    // The metered allocator wraps page_allocator and counts live bytes/allocs for
+    // /debug/mem + /version (the leak smoke detector — see mem_meter.zig). It IS
+    // the process base allocator: everything downstream (the IO pool, the bus, the
+    // per-request arenas) allocates through it, so the meter sees the whole
+    // leakable surface. presence/reading_list capture mem_meter.base() directly.
+    const alloc = mem_meter.init(std.heap.page_allocator);
     var threaded = std.Io.Threaded.init(alloc, .{ .environ = init.environ });
     defer threaded.deinit();
     const io = threaded.io();
@@ -50,14 +72,15 @@ pub fn main(init: std.process.Init.Minimal) !void {
     try config.load(io, alloc, env);
 
     // The pub/sub fan-out shared across all connections. Lives for the process
-    // lifetime; shared by chat's SSE streams and the /spike surface.
+    // lifetime; drives chat's SSE streams.
     var bus = Bus.init(io, alloc);
 
-    const addr = try net.IpAddress.parse("0.0.0.0", PORT);
+    const port = portFromEnv(env);
+    const addr = try net.IpAddress.parse("0.0.0.0", port);
     var listener = try addr.listen(io, .{ .reuse_address = true });
     defer listener.deinit(io);
 
-    std.debug.print("zig-server: http://localhost:{d}  (/driving, /puzzles, /game, /spike, /chat, /channel)\n", .{PORT});
+    std.debug.print("zig-server: http://localhost:{d}  (/driving, /puzzles, /game, /chat, /channel)\n", .{port});
 
     // Each connection becomes a concurrent task in this group. We never await it
     // — the server runs forever and completed tasks self-reap (see file header).
@@ -129,24 +152,47 @@ fn handleConn(io: std.Io, alloc: std.mem.Allocator, bus: *Bus, stream: net.Strea
 /// route picks the handler by path prefix, passing the remainder (the path with
 /// the prefix stripped, e.g. "/app.js" or "/sessions/3/...").
 fn route(req: *std.http.Server.Request, io: std.Io, alloc: std.mem.Allocator, bus: *Bus) !void {
-    const path = stripQuery(req.head.target);
+    const path = stripQuery(try http.target(req, alloc));
 
     if (matchPrefix(path, "/driving")) |sub| {
         try driving.handle(req, sub);
+    } else if (matchPrefix(path, "/delivery")) |sub| {
+        try delivery.handle(req, sub);
+    } else if (matchPrefix(path, "/chess")) |sub| {
+        // Public + ungated like /driving: little chess toys (Knight's Tour,
+        // Eight Queens) + /chess/code, the sources-as-exhibit page. The viewer
+        // is resolved for the index's top-bar chip, never gated (like /blog).
+        const uid = try users.currentUserID(io, alloc, req);
+        try chess.handle(req, io, alloc, uid, sub);
     } else if (matchPrefix(path, "/puzzles")) |sub| {
         try puzzles.handle(req, io, alloc, sub);
     } else if (matchPrefix(path, "/game")) |sub| {
         try game.handle(req, io, alloc, sub);
-    } else if (matchPrefix(path, "/spike")) |sub| {
-        try spike.handle(req, io, alloc, bus, sub);
     } else if (matchPrefix(path, "/chat")) |sub| {
         try chat.handle(req, io, alloc, bus, sub);
     } else if (matchPrefix(path, "/channel")) |sub| {
         try chat.handleChannel(req, io, alloc, bus, sub);
     } else if (matchPrefix(path, "/settings")) |sub| {
         try settings.handle(req, io, alloc, bus, sub);
+    } else if (matchPrefix(path, "/blog")) |sub| {
+        // Public. Reading never gates; posting a comment mints a guest if needed.
+        // Resolve the viewer (for the top bar + comment attribution) but never gate.
+        const uid = try users.currentUserID(io, alloc, req);
+        try blog.handle(req, io, alloc, bus, uid, sub);
     } else if (matchPrefix(path, "/learn")) |sub| {
         try learn.handle(req, sub);
+    } else if (matchPrefix(path, "/tutorial")) |sub| {
+        // Public + ungated: the Lyn Rummy beginner tutorial — its audience
+        // is people who haven't made an account yet.
+        try tutorial.handle(req, sub);
+    } else if (matchPrefix(path, "/gallery")) |sub| {
+        // Hidden-for-now: unlinked but public + ungated. Serves the stylized app
+        // images (free-standing content read from gallery/) for the home page.
+        try gallery.handle(req, io, alloc, sub);
+    } else if (matchPrefix(path, "/downloads")) |sub| {
+        // Public + ungated: downloadable artifacts (the native Linux Safari
+        // executable) read from downloads/, rsync'd on deploy — see downloads.zig.
+        try downloads.handle(req, io, alloc, sub);
     } else if (matchPrefix(path, "/admin")) |sub| {
         try admin.handle(req, io, alloc, sub);
     } else if (matchPrefix(path, "/login")) |sub| {
@@ -155,8 +201,25 @@ fn route(req: *std.http.Server.Request, io: std.Io, alloc: std.mem.Allocator, bu
         try login.handleLogout(req, io, alloc);
     } else if (matchPrefix(path, "/images")) |sub| {
         try brand.handle(req, sub);
+    } else if (std.mem.eql(u8, path, "/safari_download") or std.mem.eql(u8, path, "/safari_download/")) {
+        // Public, read-only. The "Install locally" landing page for the Safari
+        // screensaver (server-owned markdown → download links) — see safari_download.zig.
+        try safari_download.handle(req, io, alloc);
+    } else if (std.mem.eql(u8, path, "/steve-resume")) {
+        // Public, read-only. A single server-owned markdown page (pages/steve-resume.md)
+        // rendered through the trusted markdown pipeline — no viewer resolution, no gate.
+        try resume_page.handle(req, io, alloc);
+    } else if (std.mem.eql(u8, path, "/steve-resume.pdf")) {
+        // The pre-generated static PDF of the same page (ops/build_resume_pdf).
+        try resume_page.handlePdf(req, io, alloc);
     } else if (std.mem.eql(u8, path, "/version")) {
         try home.handleVersion(req, alloc);
+    } else if (std.mem.eql(u8, path, "/debug/mem")) {
+        // The leak smoke detector: live bytes/allocs on the base allocator. The
+        // stress harness hammers an endpoint and watches this climb (leak) or
+        // plateau (legit cache). Public + ungated on purpose — it leaks no data,
+        // only aggregate counts.
+        try home.handleDebugMem(req, alloc);
     } else if (std.mem.eql(u8, path, "/")) {
         // The site root: the launch pad. TOTALLY_PUBLIC, so resolve the viewer
         // for the top bar but never gate. The explicit-"/" check plus the

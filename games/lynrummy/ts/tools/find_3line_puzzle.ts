@@ -77,7 +77,7 @@ function findInSeed(seed: number): Hit[] {
       }
 
       const cardLists = board.map(s => s.cards);
-      const logical = findLogicalMovesForPlay(hands[active]!, cardLists);
+      const logical = findLogicalMovesForPlay(hands[active]!, cardLists, false);
       if (logical === null) break;
 
       if (logical.moves.length === TARGET_PLAN_LENGTH) {
@@ -206,7 +206,7 @@ function main(): void {
     console.log(`# the board (fewest first). Names encode the sorted verb-multiset +`);
     console.log(`# provenance (s<seed>t<turn>p<player>).`);
     console.log(`#`);
-    console.log(`# Format matches curated_4line_puzzles.dsl. UI: views/puzzle.go consumes`);
+    console.log(`# Format matches curated_4line_puzzles.dsl. UI: the server (puzzles.zig) consumes`);
     console.log(`# directly. No conformance — these are surfacing-only puzzles.`);
     console.log();
     for (const hit of subset) dumpPuzzleDsl(hit);

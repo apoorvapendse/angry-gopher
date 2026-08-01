@@ -28,4 +28,12 @@ echo "===== ops/test_ts ====="
 ./ops/test_ts
 
 echo
+echo "===== ops/test_tutorial ====="
+./ops/test_tutorial
+
+echo
+echo "===== ops/check_solver ====="
+./ops/check_solver
+
+echo
 echo "Lyn Rummy gate passed in $((SECONDS - t0_total))s."

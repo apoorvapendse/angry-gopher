@@ -38,5 +38,20 @@ echo
 echo "===== ops/test_chat ====="
 ./ops/test_chat
 
+# Driving (Safari) subsystem: the baked-critter render cull gate.
+echo
+echo "===== ops/check_safari ====="
+./ops/check_safari
+
+# Chess toys: every toy root's native unit tests (pinned event counts).
+echo
+echo "===== ops/check_chess ====="
+./ops/check_chess
+
+# Lyn Rummy solver rethink: the fresh zig solver's native unit tests.
+echo
+echo "===== ops/check_solver ====="
+./ops/check_solver
+
 echo
 echo "All gates passed in $((SECONDS - t0_total))s."

@@ -122,8 +122,42 @@ init flags =
 -- UPDATE
 
 
+{-| Re-step the sticky hand-loner flag after every action. The seam is
+here — after `updateInner` — rather than in each board-mutating branch,
+because every player action funnels through `update` and every one of
+them can change the board (a hand-to-stack play can even clean it). The
+transition reads only the log's most recent event and the resulting
+board, and is idempotent under a stable (event, board), so running it on
+non-mutating messages (pointer moves, hint responses) is a safe no-op.
+-}
 update : Msg -> Model -> ( Model, Cmd Msg )
 update msg model =
+    let
+        ( stepped, cmd ) =
+            updateInner msg model
+
+        -- Step from STEPPED's flag, not the pre-update model's: for every
+        -- ordinary message they are the same value, but the resume bootstrap
+        -- (ActionLogFetched) computes the flag by folding the whole action
+        -- log inside updateInner — re-stepping from the pre-bootstrap model
+        -- (init default False) would clobber that fold whenever the log's
+        -- last event merely carries the flag (e.g. a cosmetic MoveStack).
+        handLonerActive =
+            case List.head (List.reverse stepped.actionLog) of
+                Just entry ->
+                    ActionLog.stepHandLonerFlag
+                        (Status.isCleanBoard stepped.gameState.board)
+                        entry.action
+                        stepped.handLonerActive
+
+                Nothing ->
+                    stepped.handLonerActive
+    in
+    ( { stepped | handLonerActive = handLonerActive }, cmd )
+
+
+updateInner : Msg -> Model -> ( Model, Cmd Msg )
+updateInner msg model =
     case msg of
         ReadyForAgentTurn { afterTurn, outboundPayload } ->
             -- Commit P1's turn-end (gameState flip, actionLog
@@ -343,7 +377,10 @@ update msg model =
                         |> List.map .card
 
                 payload =
-                    Engine.buildGameHintRequest reqId hand model.gameState.board
+                    Engine.buildGameHintRequest reqId
+                        hand
+                        model.gameState.board
+                        model.handLonerActive
             in
             ( { model
                 | hintedCards = []
@@ -689,11 +726,14 @@ update msg model =
             , Cmd.none
             )
 
-        HintLinesReceived lines ->
+        HintLinesReceived (first :: _) ->
+            -- The status bar has room for one line: show the plan's FIRST
+            -- step (the move to make right now). engine_glue.js logs the
+            -- full plan to the developer console.
             ( { model
                 | pendingEngineRequest = Nothing
                 , hintedCards = []
-                , status = { text = String.join "\n" lines, kind = Inform }
+                , status = { text = first, kind = Inform }
               }
             , Cmd.none
             )

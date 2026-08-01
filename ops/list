@@ -30,7 +30,22 @@ Available ops commands (run from repo root):
   ops/check_common       Shared base = check_zig + test_docs + test_css (diamond floor).
   ops/test_ts            TS solver/engine suite (~20s) — Lyn Rummy.
   ops/test_elm           Elm client suite (~5s) — Lyn Rummy.
+  ops/test_tutorial      /tutorial authoring gate (<1s) — Lyn Rummy. Rules-port
+                         unit cases + every board in tutorial.html parses, fits
+                         the table, and figures hold only legal melds.
   ops/test_chat          Chat client lint (~1s): chat.js + docs.js + chat_client.py.
+  ops/check_solver       Lyn Rummy zig-solver gate (~2s): native unit tests
+                         for the fresh solver in games/lynrummy/zig (the
+                         rethink; TS engine stays production). Composed by
+                         ops/check and ops/check_lynrummy.
+  ops/check_safari       Safari render cull gate (~1s) — driving. Drives the
+                         committed safari.wasm across a full course and asserts
+                         no draw-buffer overflow + both critter culls (segment
+                         reach + projected size) stay live. Composed by ops/check.
+  ops/check_delivery     Delivery TS→zig port gate: TS typecheck + zig unit
+                         tests + gold_check (all 20 gold shifts re-solved and
+                         compared bit-for-bit against delivery/solver_gold.json).
+                         Standalone for now (not composed by ops/check).
   ops/test_docs          doc_xref --all (~1s) — common.
   ops/test_css           check_css (~1s) — common. Flag CSS classes defined
                          in any server/**/*.go <style> block that no Go/JS/
@@ -53,10 +68,19 @@ Available ops commands (run from repo root):
   ops/build_engine_js    Bundle the TS engine into elm/engine.js via
                          esbuild. Run after any games/lynrummy/ts/
                          edit before testing the live Elm UI.
-  ops/build_driving      Bundle the driving game's TS into
-                         games/driving/app.js via esbuild (served at
-                         /driving, embedded by zig build). Called by
-                         ops/start. Run after any games/driving/ edit.
+  ops/build_delivery_wasm Build the Delivery solver's zig core into
+                         delivery/solver.wasm (committed; served at
+                         /delivery/solver.wasm, embedded by zig build).
+                         Run after any delivery/zig/ edit — or just run
+                         ops/check_delivery, which rebuilds + conforms it.
+  ops/build_safari_wasm  Build the Safari Screensaver's zig core into
+                         games/driving/safari.wasm (the /driving game,
+                         embedded by zig build). Called by ops/start. Run
+                         after any games/driving/wasm/ edit.
+  ops/bake_emoji         Bake the safari/farm critters from vendored Twemoji
+                         SVGs (emoji_svg/) into polygons (wasm/emoji_frames.zig)
+                         + a snap/emoji_baked.png contact sheet. Re-run after
+                         editing the SVGs; the seam stays polygon-only (no glyphs).
 
   REGEN & TOOLS
   -------------

@@ -1,0 +1,61 @@
+# Gallery
+
+One **stylized, somewhat-faithful** image per app, destined for the home page —
+deliberately *not* screenshots (which go stale even on a parked app). Each is a
+one-time render or hand-authored asset, committed here as content.
+
+Served by `zig-server/src/gallery.zig` at **`/gallery`** — a hidden-for-now
+preview surface (unlinked, but public): one card per app, in home-page order,
+showing the image if present or a `pending` placeholder otherwise. Images are read
+from this directory at request time and rsync'd by `ops/deploy` (like `blog/posts/`
+and `pages/`), not embedded in the binary.
+
+Filenames are `<slug>.png` (or `.svg`), where the slugs match the manifest in
+`gallery.zig`:
+
+| slug | app |
+|------|-----|
+| `delivery` | Seattle Delivery |
+| `safari` | Safari Screensaver |
+| `chat` | Chat |
+| `blog` | Blog |
+| `lynrummy` | Play Lyn Rummy |
+| `puzzles` | Lyn Rummy Puzzles |
+| `chess` | Chess Toys |
+
+## Authoring rules
+
+- **Anything directional faces RIGHT.** Images sit left of the text on the
+  home page, so a left-facing subject "walks off" the page. Standing rule.
+- **The image must be honest** — it can't imply a feature the app doesn't
+  have (an early chat.svg had reaction emoji; we have no reactions, so they
+  came out). Stylized is fine; fictional is not.
+- **Prefer deriving the image from the app's own code** over inventing an
+  illustration (see `safari.png` and `delivery.svg` below) — faithful and
+  stale-proof by construction. An invented 3D-truck illustration for
+  delivery went in circles until we rendered the app's real map instead.
+- **Previewing SVG:** a browser (or reading the file) shows you the source's
+  intent, but for actual pixels render locally with `cairosvg` to a PNG.
+  The gallery serves from disk at request time, so a running `ops/start`
+  server shows edits at `/gallery` with no rebuild — the final visual call
+  is a browser look.
+
+## How each image is made
+
+- **`safari.png`** — `ops/gallery_cat`. Runs the game's REAL cat-drawing code
+  (`cat_anatomy.ts` via `catScenery`) against the dependency-free `MiniCanvas`
+  rasterizer (`games/driving/gallery_cat.ts`), composing a single dusk-lit cat on
+  the road. Faithful because it *is* the app's code; stale-proof for the same
+  reason. Re-run if the cat anatomy changes.
+- **`delivery.svg`** — `ops/gallery_delivery`. Renders the app's real Seattle map
+  straight from `delivery/geography.ts` (coastlines, lakes, Mercer Island, the road
+  network, the I-5 spine + bridges, the warehouse), then colours 100 homes across the
+  8 truck routes with tour lines routed over the actual road graph (shortest paths).
+  Faithful content — the geometry is the app's own, no duplication — but stylized
+  framing: cropped to the gallery ratio and given a clean solved-looking allocation
+  (nearest-anchor grouping, not the live solver). Re-run if the map geometry changes.
+- **`chess.svg`** — hand-authored via a one-off script (not kept): a Knight's Tour
+  mid-search using the live toys' real visual grammar (a legal knight walk with move
+  numbers, the retracted branch in red, the head's open hops as green dots), plus a
+  knight and a queen standing in the foreground — one piece per shipped toy.
+- The rest are **pending** — approach per app still to be decided.
